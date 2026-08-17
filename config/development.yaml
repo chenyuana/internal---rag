@@ -1,0 +1,24 @@
+app:
+  environment: development
+
+access_control:
+  mode: development_passthrough
+
+ragflow:
+  required: false
+
+models:
+  answer:
+    required: false
+  verifier:
+    required: false
+  embedding:
+    required: false
+  reranker:
+    required: false
+
+logging:
+  level: DEBUG
+
+retrieval:
+  allow_rerank_fallback: true

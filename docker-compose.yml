@@ -1,0 +1,88 @@
+name: internal-rag
+
+services:
+  rag-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      INTERNAL_RAG_CONFIG_DIR: /app/config
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://internal_rag:change-me@postgres:5432/internal_rag}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+      RAGFLOW_BASE_URL: ${RAGFLOW_CONTAINER_BASE_URL:-http://host.docker.internal:9380}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      - "${RAG_ROOT:-D:/internal-rag}/logs/gateway:/app/logs"
+      - "${RAG_ROOT:-D:/internal-rag}/temp:/app/temp"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-internal_rag}
+      POSTGRES_USER: ${POSTGRES_USER:-internal_rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - "${RAG_ROOT:-D:/internal-rag}/data/postgres:/var/lib/postgresql/data"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-internal_rag} -d ${POSTGRES_DB:-internal_rag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - "${RAG_ROOT:-D:/internal-rag}/data/redis:/data"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:latest}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-internal-rag}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-now}
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - "${RAG_ROOT:-D:/internal-rag}/data/minio:/data"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+# RAGFlow 使用 deploy/ragflow 下的官方本地部署包和 D 盘覆盖层单独启动，
+# 以避免复制、裁剪其 MySQL/Elasticsearch/MinIO/Redis 依赖定义。
+# Gateway 通过 http://host.docker.internal:9380 访问该本地实例。

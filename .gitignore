@@ -1,0 +1,32 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+logs/
+temp/
+tmp/
+
+# Local knowledge-base content and service state.
+# Production data currently lives outside this repository under D:/internal-rag,
+# but keep these entries as a guard against accidental copies into the worktree.
+/data/
+/knowledge-base/
+/knowledge_base/
+/uploads/
+/secrets/
+/models/
+/runtime/
+/cache/
+/backups/
+/deliverables/
+/installers/
+/.dsh-uploads/
+/D*/

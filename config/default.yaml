@@ -1,0 +1,138 @@
+app:
+  name: internal-rag
+  version: 0.1.0
+  environment: ${APP_ENV:-development}
+  host: ${APP_HOST:-0.0.0.0}
+  port: ${APP_PORT:-8080}
+
+database:
+  url: ${DATABASE_URL:-postgresql+asyncpg://internal_rag:change-me@localhost:5432/internal_rag}
+
+redis:
+  url: ${REDIS_URL:-redis://localhost:6379/0}
+
+object_storage:
+  endpoint: ${MINIO_ENDPOINT:-http://localhost:9000}
+  bucket: ${MINIO_BUCKET:-internal-rag-documents}
+  access_key: ${MINIO_ROOT_USER:-internal-rag}
+  secret_key: ${MINIO_ROOT_PASSWORD:-change-me-now}
+
+ragflow:
+  enabled: ${RAGFLOW_ENABLED:-false}
+  required: ${RAGFLOW_REQUIRED:-false}
+  base_url: ${RAGFLOW_BASE_URL:-http://localhost:9380}
+  api_key: ${RAGFLOW_API_KEY:-}
+  health_path: ${RAGFLOW_HEALTH_PATH:-/api/v1/system/healthz}
+  timeout_seconds: 10
+  publish_timeout_seconds: ${RAGFLOW_PUBLISH_TIMEOUT_SECONDS:-120}
+  publish_batch_size: ${RAGFLOW_PUBLISH_BATCH_SIZE:-16}
+
+ingestion:
+  enabled: ${INGESTION_ENABLED:-true}
+  root_dir: ${INGESTION_ROOT:-D:/internal-rag/data/ingestion}
+  max_upload_bytes: ${INGESTION_MAX_UPLOAD_BYTES:-209715200}
+  allowed_extensions:
+    - .pdf
+    - .docx
+  preview_chunk_limit: 10
+  worker_concurrency: ${INGESTION_WORKER_CONCURRENCY:-1}
+  mineru:
+    enabled: ${MINERU_ENABLED:-false}
+    base_url: ${MINERU_BASE_URL:-http://127.0.0.1:8886}
+    health_path: ${MINERU_HEALTH_PATH:-/openapi.json}
+    timeout_seconds: ${MINERU_TIMEOUT_SECONDS:-1800}
+    backend: ${MINERU_BACKEND:-pipeline}
+    parse_method: ${MINERU_PARSE_METHOD:-auto}
+    page_batch_size: ${MINERU_PAGE_BATCH_SIZE:-10}
+  docling:
+    enabled: ${DOCLING_ENABLED:-false}
+    base_url: ${DOCLING_BASE_URL:-http://127.0.0.1:5001}
+    health_path: ${DOCLING_HEALTH_PATH:-/openapi.json}
+    timeout_seconds: ${DOCLING_TIMEOUT_SECONDS:-1800}
+    backend: remote
+    parse_method: ${DOCLING_PARSE_METHOD:-raw}
+  figure_vlm:
+    enabled: ${FIGURE_VLM_ENABLED:-false}
+    base_url: ${FIGURE_VLM_BASE_URL:-http://127.0.0.1:11434}
+    health_path: ${FIGURE_VLM_HEALTH_PATH:-/api/version}
+    model_name: ${FIGURE_VLM_MODEL_NAME:-qwen3.5:9b-q4_K_M}
+    timeout_seconds: ${FIGURE_VLM_TIMEOUT_SECONDS:-300}
+    max_output_tokens: ${FIGURE_VLM_MAX_OUTPUT_TOKENS:-800}
+
+access_control:
+  mode: ${ACCESS_CONTROL_MODE:-deny_all}
+  static_grants: {}
+
+models:
+  answer:
+    enabled: ${ANSWER_MODEL_ENABLED:-false}
+    required: ${ANSWER_MODEL_REQUIRED:-false}
+    base_url: ${ANSWER_MODEL_BASE_URL:-http://localhost:8000/v1}
+    api_key: ${ANSWER_MODEL_API_KEY:-}
+    model_name: ${ANSWER_MODEL_NAME:-Qwen3.5-9B}
+    timeout_seconds: 60
+    temperature: 0.1
+    max_output_tokens: 2048
+  verifier:
+    enabled: ${VERIFIER_MODEL_ENABLED:-false}
+    required: ${VERIFIER_MODEL_REQUIRED:-false}
+    base_url: ${VERIFIER_MODEL_BASE_URL:-http://localhost:8001/v1}
+    api_key: ${VERIFIER_MODEL_API_KEY:-}
+    model_name: ${VERIFIER_MODEL_NAME:-Qwen3-4B-Instruct-2507}
+    timeout_seconds: 30
+    temperature: 0
+    max_output_tokens: 512
+  embedding:
+    enabled: ${EMBEDDING_MODEL_ENABLED:-false}
+    required: ${EMBEDDING_MODEL_REQUIRED:-false}
+    base_url: ${EMBEDDING_MODEL_BASE_URL:-http://localhost:8002/v1}
+    api_key: ${EMBEDDING_MODEL_API_KEY:-}
+    model_name: ${EMBEDDING_MODEL_NAME:-Qwen3-Embedding-0.6B}
+    timeout_seconds: 30
+  reranker:
+    enabled: ${RERANKER_MODEL_ENABLED:-false}
+    required: ${RERANKER_MODEL_REQUIRED:-false}
+    base_url: ${RERANKER_MODEL_BASE_URL:-http://localhost:8003/v1}
+    api_key: ${RERANKER_MODEL_API_KEY:-}
+    model_name: ${RERANKER_MODEL_NAME:-Qwen3-Reranker-0.6B}
+    timeout_seconds: 30
+    operation_path: ${RERANKER_PATH:-/rerank}
+
+retrieval:
+  candidate_top_k: 30
+  rerank_input_k: 30
+  rerank_top_k: 6
+  max_final_chunks: 8
+  similarity_threshold: 0.25
+  vector_similarity_weight: 0.3
+  allow_rerank_fallback: false
+  enable_ragflow_keyword_extraction: false
+  enable_query_rewrite: true
+  enable_parent_context: true
+  enable_adjacent_context: true
+  max_adjacent_chunks: 1
+  max_complex_subqueries: 12
+  complex_candidates_per_subquery: 6
+  complex_rerank_input_k: 36
+  complex_similarity_threshold: 0.15
+  complex_min_rerank_score: 0.1
+
+generation:
+  require_citations: true
+  reject_on_no_evidence: true
+  allow_partial_answer: true
+  json_repair_attempts: 1
+  max_evidence_sentences: 16
+  max_sentences_per_citation: 3
+  min_evidence_overlap: 0.08
+  answer_prompt_path: prompts/answer_generation.txt
+  repair_prompt_path: prompts/json_repair.txt
+  prompt_version: answer-generation-v1
+
+logging:
+  level: ${LOG_LEVEL:-INFO}
+  json: true
+  store_full_query: true
+  store_full_context: false
+  store_model_raw_output: false
+  mask_sensitive_data: true

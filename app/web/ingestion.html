@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>资料接入台 · Internal RAG</title>
+    <meta
+      name="description"
+      content="内网技术资料自动解析、质量复核与 RAGFlow 发布工作台"
+    />
+    <link rel="stylesheet" href="/assets/ingestion.css?v=20260803-2" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/ingestion" aria-label="资料接入台首页">
+        <span class="brand-mark">IR</span>
+        <span>
+          <strong>Internal RAG</strong>
+          <small>网关 · 检索与问答</small>
+        </span>
+      </a>
+      <nav class="main-nav" aria-label="主导航">
+        <a class="nav-tab active" href="/ingestion" aria-current="page">资料接入台</a>
+        <a class="nav-tab" href="/chat">智能问答</a>
+      </nav>
+      <div class="topbar-right">
+        <div class="service-strip" id="serviceStrip" aria-live="polite">
+          <span class="service-pill muted">正在检查本地服务…</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">单入口 · 自动判断 · 全程可追溯</p>
+          <h1>把复杂资料，变成<br /><em>可验证的知识。</em></h1>
+          <p class="hero-copy">
+            无需选择 Manual、Laws 或 Table。系统会自动判断页面类型，
+            调用本地解析器，清洗并切分内容，通过质量门禁后再发布到 RAGFlow。
+          </p>
+        </div>
+        <div class="metric-panel" aria-label="任务队列状态">
+          <div>
+            <span>执行策略</span>
+            <strong>串行</strong>
+          </div>
+          <div>
+            <span>正在处理</span>
+            <strong id="activeMetric">0</strong>
+          </div>
+          <div>
+            <span>等待任务</span>
+            <strong id="queuedMetric">0</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <article class="upload-card">
+          <div class="section-heading">
+            <div>
+              <span class="step-number">01</span>
+              <h2>上传资料</h2>
+            </div>
+            <span class="hint">当前支持 PDF、Word（DOCX）</span>
+          </div>
+
+          <div class="dropzone" id="dropzone">
+            <input
+              id="fileInput"
+              type="file"
+              accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              multiple
+            />
+            <input
+              id="folderInput"
+              type="file"
+              accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              webkitdirectory
+              directory
+              multiple
+            />
+            <span class="upload-icon" aria-hidden="true">＋</span>
+            <strong id="dropTitle">拖入一个或多个 PDF/Word 文档，或从下方选择</strong>
+            <small id="dropMeta">支持批量文件和整个文件夹；接收 PDF 与 DOCX</small>
+            <div class="upload-source-actions">
+              <button class="upload-source-button" id="selectFilesButton" type="button">
+                选择文件
+              </button>
+              <button class="upload-source-button folder" id="selectFolderButton" type="button">
+                选择文件夹
+              </button>
+            </div>
+          </div>
+
+          <div class="selected-files" id="selectedFiles" hidden></div>
+
+          <label class="field">
+            <span>目标 RAGFlow Dataset ID</span>
+            <input
+              id="datasetInput"
+              type="text"
+              autocomplete="off"
+              placeholder="可稍后填写；dry-run 前必须指定"
+            />
+          </label>
+
+          <button class="primary-button" id="uploadButton" type="button" disabled>
+            提交自动处理
+          </button>
+          <p class="form-message" id="formMessage" role="status"></p>
+        </article>
+
+        <article class="queue-card">
+          <div class="section-heading">
+            <div>
+              <span class="step-number">02</span>
+              <h2>处理队列</h2>
+            </div>
+            <div class="refresh-control">
+              <span id="lastRefresh" aria-live="polite"></span>
+              <button class="text-button" id="refreshButton" type="button">
+                <span class="refresh-symbol" aria-hidden="true">↻</span>
+                <span id="refreshLabel">刷新</span>
+              </button>
+            </div>
+          </div>
+          <div class="queue-search" role="search">
+            <span class="queue-search-icon" aria-hidden="true">⌕</span>
+            <input
+              id="jobSearchInput"
+              type="search"
+              autocomplete="off"
+              placeholder="查询文件名、文件夹、状态或任务 ID"
+              aria-label="查询资料处理状态"
+            />
+            <button id="clearJobSearch" type="button" hidden aria-label="清空资料查询">×</button>
+          </div>
+          <p class="queue-search-meta" id="jobSearchMeta" aria-live="polite"></p>
+          <nav class="queue-tabs" aria-label="审核与发布状态筛选">
+            <button class="queue-tab active" type="button" data-job-view="unreviewed">
+              <span>待审核</span>
+              <strong id="unreviewedJobCount">0</strong>
+            </button>
+            <button class="queue-tab" type="button" data-job-view="in_review">
+              <span>审核中</span>
+              <strong id="inReviewJobCount">0</strong>
+            </button>
+            <button class="queue-tab" type="button" data-job-view="approved">
+              <span>已通过</span>
+              <strong id="approvedJobCount">0</strong>
+            </button>
+            <button class="queue-tab" type="button" data-job-view="rework">
+              <span>需返工</span>
+              <strong id="reworkJobCount">0</strong>
+            </button>
+            <button class="queue-tab" type="button" data-job-view="published">
+              <span>已发送</span>
+              <strong id="publishedJobCount">0</strong>
+            </button>
+          </nav>
+          <div class="batch-toolbar" id="batchToolbar">
+            <label class="batch-toggle">
+              <input id="selectAllApproved" type="checkbox" />
+              <span>全选已审核资料</span>
+            </label>
+            <button class="secondary-button" id="batchPublishButton" type="button" disabled>
+              批量发送
+            </button>
+          </div>
+          <div class="batch-progress" id="batchPublishProgress" hidden aria-live="polite">
+            <div>
+              <span id="batchPublishStatus">等待批量发送</span>
+              <strong id="batchPublishValue">0/0</strong>
+            </div>
+            <span class="batch-progress-track">
+              <span id="batchPublishFill"></span>
+            </span>
+          </div>
+          <div class="job-list" id="jobList">
+            <div class="empty-state">尚无任务，上传第一份资料开始测试。</div>
+          </div>
+        </article>
+      </section>
+
+      <section class="detail-card" id="detailCard" hidden>
+        <div class="detail-header">
+          <div>
+            <p class="eyebrow">处理结果</p>
+            <h2 id="detailTitle">文档</h2>
+            <p id="detailMeta"></p>
+          </div>
+          <span class="status-badge" id="detailStatus">queued</span>
+        </div>
+
+        <section class="progress-panel" id="processingProgress" aria-live="polite">
+          <div class="progress-heading">
+            <div>
+              <span class="progress-kicker">解析进度</span>
+              <strong id="processingProgressLabel">等待处理</strong>
+            </div>
+            <span id="processingProgressValue">0%</span>
+          </div>
+          <div
+            class="progress-track"
+            id="processingProgressTrack"
+            role="progressbar"
+            aria-label="文档解析进度"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="0"
+          >
+            <span class="progress-fill" id="processingProgressFill"></span>
+          </div>
+          <p id="processingProgressMessage">等待进入处理队列</p>
+        </section>
+
+        <section class="progress-panel publication-progress" id="publicationProgress" hidden aria-live="polite">
+          <div class="progress-heading">
+            <div>
+              <span class="progress-kicker">RAGFlow 发布进度</span>
+              <strong id="publicationProgressLabel">尚未发布</strong>
+            </div>
+            <span id="publicationProgressValue">0%</span>
+          </div>
+          <div
+            class="progress-track"
+            id="publicationProgressTrack"
+            role="progressbar"
+            aria-label="RAGFlow 发布进度"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="0"
+          >
+            <span class="progress-fill" id="publicationProgressFill"></span>
+          </div>
+          <p id="publicationProgressMessage">尚未生成发布计划</p>
+        </section>
+
+        <section class="review-panel" id="reviewPanel" aria-live="polite">
+          <div class="review-panel-heading">
+            <div>
+              <span class="progress-kicker">人工审核</span>
+              <strong id="reviewProgressSummary">等待开始审核</strong>
+            </div>
+            <span class="review-status-badge unreviewed" id="reviewStatusBadge">待审核</span>
+          </div>
+          <p class="review-queue-position" id="reviewQueuePosition">当前资料尚未进入审核序列</p>
+          <label class="review-note-field">
+            <span>审核备注（“需返工”时必填）</span>
+            <textarea
+              id="reviewNote"
+              maxlength="2000"
+              rows="3"
+              placeholder="记录缺页、表格、公式、OCR 或 Chunk 等问题"
+            ></textarea>
+          </label>
+          <div class="review-navigation">
+            <button class="secondary-button" id="previousReviewButton" type="button">上一份</button>
+            <button class="secondary-button" id="nextReviewButton" type="button">下一份</button>
+            <span class="review-navigation-spacer"></span>
+            <button class="secondary-button" id="saveReviewNextButton" type="button">
+              暂存并下一份
+            </button>
+            <button class="secondary-button review-rework-button" id="reworkReviewNextButton" type="button">
+              需返工并下一份
+            </button>
+            <button class="secondary-button review-override-button" id="overrideReviewButton" type="button">
+              人工确认无误
+            </button>
+            <button class="primary-button" id="approveReviewNextButton" type="button">
+              审核通过并下一份
+            </button>
+          </div>
+        </section>
+
+        <div class="quality-grid" id="qualityGrid"></div>
+
+        <div class="detail-columns">
+          <div>
+            <div class="subheading">
+              <h3>页面路由</h3>
+              <span>自动解析决策</span>
+            </div>
+            <div id="routeSummary" class="route-summary"></div>
+          </div>
+          <div>
+            <div class="subheading">
+              <h3>质量门禁</h3>
+              <span>发布前检查</span>
+            </div>
+            <div id="qualityGates" class="gate-list"></div>
+          </div>
+        </div>
+
+        <div class="subheading page-review-heading">
+          <div>
+            <h3>页面解析检查</h3>
+            <span>点击页码直接打开原文件并定位到对应页，不会重新下载</span>
+          </div>
+          <button class="text-button issue-page-button" id="firstIssuePageButton" type="button" hidden>
+            查看首个问题页
+          </button>
+        </div>
+        <div id="pageDiagnostics" class="page-diagnostics"></div>
+
+        <div class="subheading chunks-heading">
+          <h3>Chunk 预览</h3>
+          <span>最多显示前 10 条</span>
+        </div>
+        <div id="chunkPreview" class="chunk-list"></div>
+
+        <div class="action-bar">
+          <div>
+            <button class="secondary-button" id="retryButton" type="button">
+              重新处理
+            </button>
+          </div>
+          <div class="publish-actions">
+            <button class="secondary-button" id="dryRunButton" type="button">
+              生成发布计划
+            </button>
+            <button class="primary-button danger-safe" id="publishButton" type="button">
+              发布到测试知识库
+            </button>
+          </div>
+        </div>
+        <p class="form-message" id="detailMessage" role="status"></p>
+      </section>
+    </main>
+
+    <dialog class="page-dialog" id="pageDialog">
+      <header class="page-dialog-header">
+        <div>
+          <p class="eyebrow">页面级诊断</p>
+          <h2 id="pageDialogTitle">解析详情</h2>
+          <p id="pageDialogMeta"></p>
+        </div>
+        <button class="dialog-close" id="pageDialogClose" type="button" aria-label="关闭">
+          ×
+        </button>
+      </header>
+      <div class="page-dialog-body">
+        <section class="source-preview">
+          <iframe id="pageSourceFrame" title="原始文档页面"></iframe>
+        </section>
+        <section class="parse-inspector">
+          <div id="pageInspectorSummary" class="page-inspector-summary"></div>
+          <details open>
+            <summary>清洗后文本</summary>
+            <pre id="pageCleanedText"></pre>
+          </details>
+          <details>
+            <summary>原始文本层</summary>
+            <pre id="pageRawText"></pre>
+          </details>
+          <details open>
+            <summary>表格与图片资产</summary>
+            <div id="pageAssets" class="page-assets"></div>
+          </details>
+          <details open>
+            <summary>条款与内容块</summary>
+            <div id="pageBlocks" class="diagnostic-list"></div>
+          </details>
+          <details open>
+            <summary>该页关联 Chunk（可人工修订）</summary>
+            <div id="pageChunks" class="diagnostic-list"></div>
+          </details>
+          <details>
+            <summary>解析器轨迹与质量门禁</summary>
+            <div id="pageTrace" class="diagnostic-list"></div>
+          </details>
+        </section>
+      </div>
+    </dialog>
+
+    <dialog class="chunk-edit-dialog" id="chunkEditDialog">
+      <form method="dialog" id="chunkEditForm">
+        <header class="chunk-edit-header">
+          <div>
+            <p class="eyebrow">人工修订</p>
+            <h2 id="chunkEditTitle">编辑 Chunk</h2>
+            <p id="chunkEditMeta"></p>
+          </div>
+          <button class="dialog-close" id="chunkEditClose" type="button" aria-label="关闭">×</button>
+        </header>
+        <div class="chunk-edit-body">
+          <div class="chunk-edit-notice">
+            修改的是后续发送到 RAGFlow 的 Chunk 内容，不会改写原始文档、原始文本层或解析资产。
+            保存后需要重新生成发布计划。
+          </div>
+          <label class="field chunk-edit-field">
+            <span>Chunk 内容</span>
+            <textarea id="chunkEditText" maxlength="200000" required></textarea>
+            <small id="chunkEditCount">0 字</small>
+          </label>
+          <label class="field">
+            <span>修改说明（可选）</span>
+            <input
+              id="chunkEditReason"
+              type="text"
+              maxlength="500"
+              placeholder="例如：修正 OCR 错字、补全跨页表格"
+            />
+          </label>
+          <p class="form-message" id="chunkEditMessage" role="status"></p>
+        </div>
+        <footer class="chunk-edit-actions">
+          <button class="secondary-button" id="chunkEditCancel" type="button">取消</button>
+          <button class="primary-button" id="chunkEditSave" type="submit">保存修订</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <script src="/assets/ingestion.js?v=20260811-docx-1" defer></script>
+  </body>
+</html>

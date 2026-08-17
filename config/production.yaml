@@ -1,0 +1,29 @@
+app:
+  environment: production
+
+access_control:
+  mode: deny_all
+
+ragflow:
+  enabled: true
+  required: true
+  timeout_seconds: 60
+
+models:
+  answer:
+    enabled: true
+    required: true
+  verifier:
+    enabled: true
+    required: true
+  embedding:
+    enabled: true
+    required: true
+  reranker:
+    enabled: true
+    required: true
+
+logging:
+  level: INFO
+  store_full_context: false
+  store_model_raw_output: false
