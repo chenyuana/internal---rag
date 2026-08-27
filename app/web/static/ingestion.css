@@ -106,18 +106,18 @@ button {
 .main-nav {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
   margin: 0 auto;
   padding: 4px;
-  background: rgba(24, 33, 29, 0.06);
+  background: rgba(23, 33, 28, 0.06);
   border-radius: 999px;
 }
 
 .nav-tab {
-  padding: 8px 18px;
+  padding: 8px 17px;
   border-radius: 999px;
-  font-size: 14px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 650;
   color: var(--muted);
   text-decoration: none;
   transition: background 0.15s, color 0.15s, box-shadow 0.15s;
@@ -125,13 +125,13 @@ button {
 }
 
 .nav-tab:hover {
-  color: var(--green);
+  color: #196347;
 }
 
 .nav-tab.active {
-  background: var(--surface);
-  color: var(--green-deep);
-  box-shadow: 0 2px 8px rgba(24, 33, 29, 0.1);
+  background: #fffefa;
+  color: #0d4732;
+  box-shadow: 0 2px 9px rgba(23, 33, 28, 0.1);
 }
 
 .service-pill,

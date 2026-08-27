@@ -13,7 +13,12 @@ QueryType: TypeAlias = Literal[
     "unknown",
 ]
 
-CoverageStatus: TypeAlias = Literal["covered", "missing"]
+CoverageStatus: TypeAlias = Literal[
+    "covered",
+    "not_specified",
+    "low_confidence",
+    "no_document",
+]
 SynthesisMode: TypeAlias = Literal["direct", "matrix", "sequence", "map_reduce"]
 ExpansionMode: TypeAlias = Literal["none", "adjacent", "section", "document"]
 
@@ -143,10 +148,13 @@ class RagflowRetrievalRequest(BaseModel):
 
 class ChunkMetadata(BaseModel):
     document_name: str | None = None
+    document_subject: str | None = None
     version: str | None = None
     source_path: str | None = None
     chapter_path: str | None = None
     section_title: str | None = None
+    section_id: str | None = None
+    section_parent_id: str | None = None
     page_number: int | None = None
     paragraph_index: int | None = None
     chunk_index: int | None = None
@@ -154,6 +162,9 @@ class ChunkMetadata(BaseModel):
     project_name: str | None = None
     device_model: str | None = None
     document_type: str | None = None
+    requirement_type: str | None = None
+    process_stage: str | None = None
+    content_type: str | None = None
     status: str | None = None
 
 
@@ -180,6 +191,8 @@ class SelectedChunk(BaseModel):
     vector_score: float
     keyword_score: float
     rerank_score: float | None = None
+    # 对比/矩阵规划下，该 chunk 来自哪个子查询（从而归属哪个对比主体）。
+    subquery_id: str | None = None
 
 
 class Citation(BaseModel):
@@ -193,6 +206,12 @@ class Citation(BaseModel):
     page_number: int | None = None
     paragraph_index: int | None = None
     quote: str
+    # When a source chunk contains a table, keep the complete markup separate
+    # from the text quote so clients can render the table instead of exposing
+    # raw ``<tr>/<td>`` tags or truncating it to a sentence preview.
+    table_html: str | None = None
+    table_title: str | None = None
+    table_htmls: list[str] = Field(default_factory=list)
 
 
 class RetrievalSearchResponse(BaseModel):

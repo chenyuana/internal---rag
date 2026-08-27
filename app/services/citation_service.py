@@ -1,6 +1,19 @@
 from __future__ import annotations
 
+import re
+
 from app.schemas.retrieval import Citation, RetrievedChunk, SelectedChunk
+from app.services.table_evidence import html_table_blocks
+
+
+def _table_title(table_html: str) -> str | None:
+    """Extract a caption for display without making the schema HTML-aware."""
+    match = re.search(r"<caption\b[^>]*>(.*?)</caption>", table_html, re.IGNORECASE | re.DOTALL)
+    if match is None:
+        return None
+    title = re.sub(r"<[^>]+>", "", match.group(1))
+    title = " ".join(title.split()).strip()
+    return title or None
 
 
 class CitationService:
@@ -14,6 +27,8 @@ class CitationService:
         citations: list[Citation] = []
         for index, chunk in enumerate(chunks, start=1):
             citation_id = f"C{index}"
+            table_htmls = html_table_blocks(chunk.text)
+            table_html = next(iter(table_htmls), None)
             selected.append(
                 SelectedChunk(
                     citation_id=citation_id,
@@ -32,6 +47,9 @@ class CitationService:
                     page_number=chunk.metadata.page_number,
                     paragraph_index=chunk.metadata.paragraph_index,
                     quote=chunk.text,
+                    table_html=table_html,
+                    table_title=_table_title(table_html) if table_html else None,
+                    table_htmls=table_htmls,
                 )
             )
         return selected, citations

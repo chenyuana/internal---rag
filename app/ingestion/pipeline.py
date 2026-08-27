@@ -101,6 +101,26 @@ TOC_DOTTED_NO_PAGE_RE = re.compile(
 TOC_NUMBERED_ENTRY_RE = re.compile(
     r"^\s*(?:第.+[章节条]|[A-Z]?\d+(?:\.\d+)+\s+.+)\s+\d+\s*$"
 )
+# 修订决定/修订说明页的信号。适航规章或标准发布"修改决定"时，会用
+# "一、将第X条修改为…"、"十六、增加一条，作为第X条"、"二十、删去第X条"这类
+# 动作句式列出修订，并用引号整页复述修订后的条款全文。这些复述与正文条款
+# 重复、没有独立条号，不应进入检索索引。
+REVISION_TITLE_RE = re.compile(
+    r"^\s*(?:修订\s*(?:决定|记录|说明|一览|页)|修改\s*(?:决定|记录|说明|一览))\s*$"
+)
+REVISION_ACTION_RE = re.compile(
+    r"(?:"
+    # "将第X条修改为" / "将第X条条款号更改为第Y条" / "将附件A第A27.4条修改为"。
+    # 必须跟修订动作词，避免误伤正文里的"应将第X条确定的重量…移到…"这类引用。
+    r"将[^。；;]{0,10}?第\s*(?:[A-Za-z]{0,8}\s*)?[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*\s*条"
+    r"[^。；;]{0,20}?(?:名称修改为|修改为|修订为|改为|更改为|顺延为|更名为)"
+    # "增加一条/一款/一目/一项，作为第X条" / "增加一个附件，作为附件D"
+    r"|增加\s*(?:一[条款项目]|一个附件)\s*[，,]?\s*作为\s*"
+    # "删去第X条"
+    r"|删\s*去?\s*第\s*(?:[A-Za-z]{0,8}\s*)?[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*\s*条"
+    r")"
+)
+_REVISION_QUOTE_CHARS = ("\u201c", "\u201d", "\u300c", "\u300e")
 LIST_ITEM_RE = re.compile(
     r"^\s*(?:[（(][一二三四五六七八九十百0-9a-zA-Z]+[）)]|"
     r"[一二三四五六七八九十百0-9a-zA-Z]+[、.)）])"
@@ -1927,6 +1947,34 @@ def _looks_like_term_heading(text: str) -> bool:
     return True
 
 
+def is_probable_revision_page(text: str) -> bool:
+    """Detect 修订决定/修订说明 pages that restate amended clauses.
+
+    Regulation/standard amendment decisions list every change with an action
+    line (``一、将第X条修改为…``) and restate the full amended clause text
+    wrapped in quote marks. Those restated clauses duplicate the normative body
+    text and carry no independent clause id, so they must not enter the
+    retrieval index. Returns True for action pages and their quote-wrapped
+    continuation pages alike.
+    """
+    lines = [normalize_line(line) for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if any(REVISION_TITLE_RE.fullmatch(line) for line in lines[:8]):
+        return True
+    if any(REVISION_ACTION_RE.search(line) for line in lines):
+        return True
+    quote_lines = sum(
+        1
+        for line in lines
+        if line.startswith(_REVISION_QUOTE_CHARS)
+        and not (
+            len(line) > 1 and line[1].isascii() and line[1].isalpha()
+        )
+    )
+    return quote_lines >= 3 and quote_lines / len(lines) >= 0.3
+
+
 def is_probable_toc_page(text: str) -> bool:
     lines = [normalize_line(line) for line in text.splitlines() if line.strip()]
     if any(TOC_TITLE_RE.fullmatch(line) for line in lines[:8]):
@@ -3260,6 +3308,10 @@ def parse_pdf(path: Path) -> ParsedDocument:
             page.is_toc = True
             page.indexable = False
             page.route = "toc_excluded"
+            continue
+        if is_probable_revision_page(page.raw_text):
+            page.indexable = False
+            page.route = "revision_excluded"
 
     text_pages = sum(page.raw_char_count >= TEXT_PAGE_MIN_CHARS for page in pages)
     coverage = text_pages / len(pages) if pages else 0.0
@@ -3329,6 +3381,9 @@ def parse_pdf(path: Path) -> ParsedDocument:
         page.page_number for page in pages if page.route == "low_text_review"
     ]
     toc_pages = [page.page_number for page in pages if page.is_toc]
+    revision_pages = [
+        page.page_number for page in pages if page.route == "revision_excluded"
+    ]
     watermark_pages = [
         page.page_number for page in pages if page.route == "watermark_excluded"
     ]
@@ -3457,6 +3512,7 @@ def parse_pdf(path: Path) -> ParsedDocument:
         "pages_requiring_ocr": ocr_pages,
         "low_text_pages": low_text_pages,
         "toc_pages": toc_pages,
+        "revision_pages": revision_pages,
         "toc_scores": {
             page.page_number: page.layout_features.get("toc_score", 0.0)
             for page in pages

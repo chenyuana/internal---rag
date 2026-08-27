@@ -5,99 +5,79 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light" />
     <title>智能问答 · Internal RAG</title>
-    <meta
-      name="description"
-      content="多阶段检索问答：复杂问题自动规划、多路召回、覆盖优先、证据约束生成"
-    />
-    <link rel="stylesheet" href="/assets/chat.css?v=20260812-1" />
+    <meta name="description" content="基于企业资料证据的多轮智能问答" />
+    <link rel="stylesheet" href="/assets/chat.css?v=20260825-1" />
   </head>
   <body>
     <header class="topbar">
-      <a class="brand" href="/chat" aria-label="智能问答首页">
-        <span class="brand-mark">IR</span>
-        <span>
-          <strong>Internal RAG</strong>
-          <small>网关 · 检索与问答</small>
-        </span>
-      </a>
-      <nav class="main-nav" aria-label="主导航">
-        <a class="nav-tab" href="/ingestion">资料接入台</a>
-        <a class="nav-tab active" href="/chat" aria-current="page">智能问答</a>
-      </nav>
-      <div class="topbar-actions">
-        <span class="service-pill" id="servicePill" aria-live="polite">正在检查服务…</span>
-      </div>
+      <a class="brand" href="/chat" aria-label="智能问答首页"><span class="brand-mark">IR</span><span><strong>Internal RAG</strong><small>证据驱动的企业智能问答</small></span></a>
+      <nav class="main-nav" aria-label="主导航"><a class="nav-tab" href="/ingestion">资料接入台</a><a class="nav-tab active" href="/chat" aria-current="page">智能问答</a><a class="nav-tab" href="/documents">文档编制</a><a class="nav-tab" href="/evaluation">评测结果</a><a class="nav-tab" href="/monitor">运行监控</a></nav>
+      <span class="service-pill" id="servicePill" aria-live="polite">正在检查服务…</span>
     </header>
 
-    <main class="shell">
-      <div class="composer-card">
-        <div class="kb-row">
-          <label class="field">
-            <span class="field-label">知识库</span>
-            <select id="kbSelect" class="kb-select" aria-label="选择知识库">
-              <option value="">加载中…</option>
-            </select>
-          </label>
-          <span class="kb-hint" id="kbHint"></span>
-        </div>
-        <div class="input-row">
-          <textarea
-            id="questionInput"
-            class="question-input"
-            rows="3"
-            placeholder="输入问题，例如：对比植被多光谱遥感无人机、普通可见光巡检无人机，在成像波段、作业最佳时段、精度评价指标上有什么不同？"
-            aria-label="问题输入"
-          ></textarea>
-          <button class="primary-button" id="sendButton" type="button" disabled>
-            <span id="sendLabel">提问</span>
-          </button>
-        </div>
-        <p class="form-message" id="formMessage" role="status"></p>
-        <div class="suggestion-row" aria-label="示例问题">
-          <span class="suggestion-label">试试：</span>
-          <button class="suggestion" type="button" data-q="对比植被多光谱遥感无人机、普通可见光巡检无人机，在成像波段、作业最佳时段、精度评价指标上有什么不同？">多光谱 vs 可见光</button>
-          <button class="suggestion" type="button" data-q="变电站巡检无人机的定义是什么？">变电站巡检无人机定义</button>
-          <button class="suggestion" type="button" data-q="野大豆空间分布无人机遥感监测的拍摄时间要求？">野大豆监测拍摄时间</button>
-        </div>
-      </div>
+    <main class="app-layout">
+      <aside class="conversation-sidebar" aria-label="历史对话">
+        <button class="new-chat-button" id="newConversation" type="button"><span>＋</span> 新建对话</button>
+        <div class="history-heading"><span>历史对话</span><small id="conversationCount">0</small></div>
+        <div class="conversation-list" id="conversationList"></div>
+        <p class="local-note">对话保存在当前浏览器中</p>
+      </aside>
 
-      <section class="answer-area" id="answerArea" aria-live="polite">
-        <div class="empty-state" id="emptyState">
-          <div class="empty-mark" aria-hidden="true">?</div>
-          <p>输入问题开始问答。复杂对比/流程/总结类问题会走多阶段检索，并展示覆盖矩阵与证据引用。</p>
+      <section class="chat-workspace">
+        <div class="chat-toolbar">
+          <label class="compact-field"><span>知识范围</span><select id="kbSelect" class="control-select"><option value="">加载中…</option></select></label>
+          <label class="compact-field model-field"><span>答案模型</span><select id="modelSelect" class="control-select"><option value="">加载中…</option></select></label>
+          <button class="toolbar-button" id="openModelDialog" type="button">接入 API</button>
+          <button class="icon-button remove-model" id="removeModelConnection" type="button" aria-label="移除当前 API 连接" hidden>−</button>
         </div>
 
-        <article class="answer-card" id="answerCard" hidden>
-          <div class="answer-head">
-            <h2 class="answer-title">回答</h2>
-            <span class="status-badge" id="statusBadge"></span>
-            <span class="answer-meta" id="answerMeta"></span>
+        <div class="conversation-stage" id="conversationStage" aria-live="polite">
+          <div class="welcome-state" id="emptyState">
+            <div class="empty-mark">⌁</div><p class="eyebrow">ASK WITH EVIDENCE</p><h1>从内部资料中获得可追溯答案</h1>
+            <p>连续查看问答记录；每条回答都可核对引用证据。</p>
+            <div class="suggestion-row">
+              <button class="suggestion" type="button" data-q="对比植被多光谱遥感无人机、普通可见光巡检无人机，在成像波段、作业最佳时段、精度评价指标上有什么不同？">多光谱与可见光</button>
+              <button class="suggestion" type="button" data-q="长大桥梁无人机精细化巡检与地质灾害倾斜摄影测量，在设备选型、像控布设、成果验收三个环节的标准要求如何统筹区分？">跨标准对比</button>
+              <button class="suggestion" type="button" data-q="野大豆空间分布无人机遥感监测的拍摄时间要求？">精确参数查询</button>
+            </div>
           </div>
-          <div class="answer-body" id="answerBody"></div>
-          <div class="answer-claims" id="claimsBlock" hidden>
-            <h3 class="sub-title">结论要点</h3>
-            <ul class="claims-list" id="claimsList"></ul>
+          <div class="message-list" id="messageList"></div>
+        </div>
+
+        <div class="composer-dock">
+          <div class="reference-chip" id="referenceChip" hidden><span class="file-icon">文</span><span class="reference-name" id="referenceName"></span><span class="reference-purpose">临时辅助资料 · 参与回答与引用</span><button id="removeReference" type="button" aria-label="移除辅助资料">×</button></div>
+          <div class="composer-box">
+            <textarea id="questionInput" rows="2" maxlength="2000" placeholder="输入问题，Enter 发送，Shift + Enter 换行" aria-label="问题输入"></textarea>
+            <div class="composer-actions">
+              <input id="referenceFileInput" type="file" accept=".pdf,.docx,.txt,.md,.markdown" hidden />
+              <button class="attach-button" id="attachReference" type="button" title="加载一份临时文档，作为本次会话的辅助知识来源"><span>⌕</span> 加载辅助资料</button>
+              <span class="form-message" id="formMessage" role="status"></span>
+              <button class="send-button" id="sendButton" type="button" disabled aria-label="发送问题">↑</button>
+            </div>
           </div>
-          <div class="coverage-block" id="coverageBlock" hidden>
-            <h3 class="sub-title">覆盖矩阵</h3>
-            <div class="coverage-grid" id="coverageGrid"></div>
-          </div>
-          <div class="missing-block" id="missingBlock" hidden>
-            <h3 class="sub-title">资料缺失</h3>
-            <ul class="missing-list" id="missingList"></ul>
-          </div>
-          <div class="citations-block" id="citationsBlock" hidden>
-            <h3 class="sub-title">引用证据</h3>
-            <ol class="citations-list" id="citationsList"></ol>
-          </div>
-          <div class="answer-foot">
-            <span id="promptVersion"></span>
-            <span id="requestId"></span>
-          </div>
-        </article>
+          <p class="composer-hint">辅助资料会参与回答并显示引用来源，但不会自动写入正式知识库。</p>
+        </div>
       </section>
+
+      <aside class="evidence-panel" aria-labelledby="evidenceTitle">
+        <div class="evidence-head"><div><p class="eyebrow">SOURCE TRACE</p><h2 id="evidenceTitle">引用证据</h2></div><span class="evidence-count" id="evidenceCount">0</span></div>
+        <p class="evidence-intro" id="evidenceIntro">选择一条回答后，可在这里核对引用原文。</p>
+        <ol class="citations-list" id="citationsList"></ol>
+      </aside>
     </main>
 
-    <script src="/assets/chat.js?v=20260812-1"></script>
+    <dialog class="model-dialog" id="modelDialog" aria-labelledby="modelDialogTitle">
+      <form class="model-dialog-card" id="modelConnectionForm">
+        <div class="dialog-head"><div><p class="eyebrow">MODEL CONNECTION</p><h2 id="modelDialogTitle">接入模型 API</h2></div><button class="icon-button" id="closeModelDialog" type="button" aria-label="关闭">×</button></div>
+        <p class="dialog-description">连接支持 OpenAI 兼容服务。API Key 仅保存在当前网关进程内存中。</p>
+        <label class="field"><span>连接名称</span><input id="connectionName" class="text-input" maxlength="80" required placeholder="例如：内部推理服务" /></label>
+        <label class="field"><span>API Base URL</span><input id="connectionBaseUrl" class="text-input" type="url" required placeholder="https://example.com/v1" /></label>
+        <label class="field"><span>API Key</span><input id="connectionApiKey" class="text-input" type="password" autocomplete="off" placeholder="没有鉴权时可留空" /></label>
+        <p class="dialog-message" id="connectionMessage" role="status"></p>
+        <div class="dialog-actions"><button class="toolbar-button" id="cancelModelConnection" type="button">取消</button><button class="primary-button" id="connectModelButton" type="submit">连接并读取模型</button></div>
+      </form>
+    </dialog>
+    <script src="/assets/markdown.js?v=20260821-3"></script>
+    <script src="/assets/chat.js?v=20260826-1"></script>
   </body>
 </html>

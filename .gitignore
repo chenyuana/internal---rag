@@ -30,3 +30,6 @@ tmp/
 /installers/
 /.dsh-uploads/
 /D*/
+
+# Keep repository documentation visible on case-insensitive Windows filesystems.
+!/docs/

@@ -6,6 +6,8 @@ from app.core.config import GenerationSettings
 from app.schemas.chat import EvidenceAssessment, EvidenceConflict
 from app.schemas.retrieval import CoverageCell, NormalizedQuery, SelectedChunk
 from app.services.evidence_text import (
+    has_parameter_value,
+    is_parametric_text,
     measured_values,
     overlap_score,
     split_requirements,
@@ -75,16 +77,21 @@ class EvidenceJudge:
         chunks: list[SelectedChunk],
         coverage_matrix: list[CoverageCell],
     ) -> EvidenceAssessment:
-        covered = [
-            self._coverage_label(cell)
-            for cell in coverage_matrix
-            if cell.status == "covered"
-        ]
-        missing = [
-            self._coverage_label(cell)
-            for cell in coverage_matrix
-            if cell.status == "missing"
-        ]
+        chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+        covered: list[str] = []
+        missing: list[str] = []
+        for cell in coverage_matrix:
+            label = self._coverage_label(cell)
+            if cell.status != "covered":
+                # 四态中仅 covered 视为需求被覆盖；not_specified /
+                # low_confidence / no_document 都进入 missing（各自的 reason
+                # 说明缺失原因，矩阵构建器会据此写"未明确说明"或保留疑似内容）。
+                missing.append(label)
+                continue
+            if self._cell_has_value_evidence(cell, chunk_by_id):
+                covered.append(label)
+            else:
+                missing.append(label)
         if not covered:
             status = "UNANSWERABLE"
         elif missing:
@@ -113,6 +120,26 @@ class EvidenceJudge:
             missing_requirements=missing,
             conflicting_citations=conflicts,
         )
+
+    @classmethod
+    def _cell_has_value_evidence(
+        cls,
+        cell: CoverageCell,
+        chunk_by_id: dict[str, SelectedChunk],
+    ) -> bool:
+        """A parameter-aspect cell is covered only when its chunks carry a
+        concrete numeric value; non-parameter aspects keep the legacy rule."""
+        if not cls._is_parametric_requirement(cell.aspect):
+            return True
+        return any(
+            has_parameter_value(chunk_by_id[cid].text)
+            for cid in cell.chunk_ids
+            if cid in chunk_by_id
+        )
+
+    @staticmethod
+    def _is_parametric_requirement(requirement: str) -> bool:
+        return is_parametric_text(requirement)
 
     @staticmethod
     def _coverage_label(cell: CoverageCell) -> str:
@@ -144,6 +171,8 @@ class EvidenceJudge:
         if required_exact:
             combined = "\n".join(sentence for _, sentence in relevant)
             return all(token in combined for token in required_exact)
+        if self._is_parametric_requirement(requirement):
+            return any(has_parameter_value(sentence) for _, sentence in relevant)
         return True
 
     @staticmethod

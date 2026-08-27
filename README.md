@@ -9,6 +9,9 @@ Agent 接手本项目时请优先阅读：
 
 - [`docs/milestone-2.md`](docs/milestone-2.md)：混合解析、质量门禁与 RAGFlow 发布。
 - [`docs/milestone-3.md`](docs/milestone-3.md)：本地 MinerU、串行队列与单入口界面。
+- [`docs/query-translation-decomposition-refactor.md`](docs/query-translation-decomposition-refactor.md)：
+  查询分解与查询转换重构实施方案（对比题确定性矩阵优先、主体文档解析、受限
+  查询转换、`EvidenceRecord` 结构化证据、评测驱动；分 Stage 0–6 实施）。
 
 企业内网技术资料 RAG 问答系统的 Gateway。目前已经具备 FastAPI 基础设施、查询
 标准化、ACL 范围过滤、RAGFlow 混合检索、Reranker、Chunk 规范化、引用映射、
@@ -137,6 +140,21 @@ RAGFlow 的 LLM 关键词扩展；term/BM25 与 Dense 混合检索仍由
 
 当前 `knowledge_base_ids` 对应 RAGFlow dataset ID。业务知识库 ID 到 dataset ID
 的数据库映射将在文档与元数据管理阶段实现。
+
+## 智能问答与模型切换
+
+浏览器访问 `http://127.0.0.1:8080/chat`。问答页可在现有本地答案模型之间切换，
+也可以临时接入支持 `GET /v1/models` 和 `POST /v1/chat/completions` 的
+OpenAI 兼容 API：
+
+```http
+GET    /api/v1/admin/answer-models
+POST   /api/v1/admin/model-connections
+DELETE /api/v1/admin/model-connections/{source_id}
+```
+
+运行时 API Key 只保存在 Gateway 进程内存中，不写入配置文件、数据库或浏览器存储；
+Gateway 重启后需要重新接入。连接和模型选择按 `X-User-ID` 隔离。
 
 ## 配置加载顺序
 

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>评测结果 · Internal RAG</title>
+    <meta name="description" content="查看 Internal RAG 自动化评测与版本回归结果" />
+    <link rel="stylesheet" href="/assets/evaluation.css?v=20260824-1" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/evaluation" aria-label="评测结果首页">
+        <span class="brand-mark">IR</span>
+        <span><strong>Internal RAG</strong><small>质量评测与版本回归</small></span>
+      </a>
+      <nav class="main-nav" aria-label="主导航">
+        <a class="nav-tab" href="/ingestion">资料接入台</a>
+        <a class="nav-tab" href="/chat">智能问答</a>
+        <a class="nav-tab" href="/documents">文档编制</a>
+        <a class="nav-tab active" href="/evaluation" aria-current="page">评测结果</a>
+        <a class="nav-tab" href="/monitor">运行监控</a>
+      </nav>
+      <span class="service-pill" id="storeStatus">正在读取评测结果…</span>
+    </header>
+
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">QUALITY OBSERVATORY</p>
+          <h1>评测结果与版本回归</h1>
+          <p>查看规则指标、检索质量、本地 Judge 结果和逐题失败原因。页面只读，不会触发新的评测。</p>
+        </div>
+        <label class="run-picker">
+          <span>评测运行</span>
+          <select id="runSelect" disabled><option>加载中…</option></select>
+        </label>
+      </section>
+
+      <section class="state-card" id="emptyState" hidden>
+        <strong>暂时没有评测数据</strong>
+        <span>请先在 rag-evaluation 中运行一次评测。</span>
+      </section>
+
+      <div id="dashboard" hidden>
+        <section class="run-head card">
+          <div>
+            <p class="eyebrow">RUN SNAPSHOT</p>
+            <h2 id="runTitle">—</h2>
+            <p id="runMeta">—</p>
+          </div>
+          <span class="regression-badge neutral" id="regressionBadge">未执行回归对比</span>
+        </section>
+
+        <section class="metric-grid" id="metricGrid" aria-label="核心指标"></section>
+
+        <section class="card regression-card" id="regressionCard" hidden>
+          <div class="section-title"><div><p class="eyebrow">REGRESSION</p><h2>版本回归</h2></div></div>
+          <div class="regression-grid" id="regressionGrid"></div>
+        </section>
+
+        <section class="card">
+          <div class="section-title">
+            <div><p class="eyebrow">CASE RESULTS</p><h2>逐题结果</h2></div>
+            <div class="filters" role="group" aria-label="筛选逐题结果">
+              <button class="filter active" type="button" data-filter="all">全部</button>
+              <button class="filter" type="button" data-filter="failed">仅失败</button>
+              <button class="filter" type="button" data-filter="p0">仅 P0</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>结果</th><th>用例</th><th>状态</th><th>规则 / Judge</th><th>耗时</th></tr></thead>
+              <tbody id="caseRows"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </main>
+    <script src="/assets/evaluation.js?v=20260824-1" defer></script>
+  </body>
+</html>

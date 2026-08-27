@@ -4,7 +4,8 @@ from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.schemas.retrieval import Citation, RetrievalFilters
+from app.schemas.models import AnswerModelSelection
+from app.schemas.retrieval import Citation, CoverageStatus, RetrievalFilters
 
 Answerability: TypeAlias = Literal[
     "ANSWERABLE",
@@ -20,6 +21,8 @@ class EvidenceSentence(BaseModel):
     citation_id: str
     chunk_id: str
     text: str = Field(min_length=1)
+    document_name: str | None = None
+    version: str | None = None
 
 
 class EvidenceConflict(BaseModel):
@@ -78,6 +81,51 @@ class ChatCompletionRequest(BaseModel):
     filters: RetrievalFilters = Field(default_factory=RetrievalFilters)
     candidate_top_k: int | None = Field(default=None, ge=1, le=100)
     conversation_id: str | None = Field(default=None, max_length=100)
+    model: AnswerModelSelection | None = None
+    reference_document: ReferenceDocument | None = None
+
+
+class ReferenceDocument(BaseModel):
+    """A request-local document used as auxiliary evidence and presentation context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=255)
+    text: str = Field(min_length=1, max_length=20_000)
+
+
+class ReferenceDocumentParsed(ReferenceDocument):
+    truncated: bool = False
+
+
+class DiagnosticCell(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cell_id: str
+    subject: str | None = None
+    aspect: str
+    status: CoverageStatus
+    document_ids: list[str] = Field(default_factory=list)
+    citation_ids: list[str] = Field(default_factory=list)
+    evidence_record_count: int = Field(default=0, ge=0)
+
+
+class ChatDiagnostics(BaseModel):
+    """Safe evaluation telemetry; never includes chunk text or model raw output."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_version: str
+    planner_source: str
+    planned_cell_count: int = Field(ge=0)
+    cells: list[DiagnosticCell] = Field(default_factory=list)
+    subject_document_ids: dict[str, list[str]] = Field(default_factory=dict)
+    retrieval_calls: int = Field(default=0, ge=0)
+    translated_cell_ids: list[str] = Field(default_factory=list)
+    model_calls: int = Field(default=0, ge=0)
+    model_call_breakdown: dict[str, int] = Field(default_factory=dict)
+    latencies_ms: dict[str, float] = Field(default_factory=dict)
+    stage_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class ChatCompletionResponse(BaseModel):
@@ -94,3 +142,8 @@ class ChatCompletionResponse(BaseModel):
     evidence_assessment: EvidenceAssessment
     prompt_version: str
     json_repaired: bool = False
+    validation_degraded: bool = False
+    validation_warnings: list[str] = Field(default_factory=list)
+    model_source_id: str | None = None
+    model_name: str | None = None
+    diagnostics: ChatDiagnostics | None = None

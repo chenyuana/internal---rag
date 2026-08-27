@@ -54,3 +54,8 @@ def test_public_config_redacts_all_secrets(settings) -> None:
     assert "change-me-now" not in payload
     assert "postgresql+asyncpg" not in payload
     assert "api_key" not in payload
+
+
+def test_answer_model_deterministic_sampling_defaults(settings) -> None:
+    assert settings.models.answer.temperature == 0.0
+    assert settings.models.answer.seed == 42

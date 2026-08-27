@@ -14,6 +14,7 @@ from app.ingestion.pipeline import (
     has_tounicode_cid_conflict,
     is_fake_cjk_garbage,
     is_glyph_name_garbage,
+    is_probable_revision_page,
     is_watermark_only_page,
     normalize_table_html,
     parse_pdf,
@@ -1129,3 +1130,108 @@ def test_glyph_name_pages_excluded_from_vector_preflight_targets() -> None:
     assert 18 not in vector_preflight_targets  # glyph-name 页排除
     assert 20 not in vector_preflight_targets  # tounicode 页排除
     assert 30 in vector_preflight_targets      # native 页保留
+
+
+def test_revision_action_line_detects_amendment_page() -> None:
+    # CCAR-27-R2 修订决定第 10 页："十六、增加一条，作为第27.573条："
+    text = "\n".join(
+        [
+            "十六、增加一条，作为第27.573条：",
+            "“第27.573条 复合材料旋翼航空器结构的损伤容限和疲劳评定",
+            "“(a)每一申请人必须按本条(d)的损伤容限标准评定……",
+        ]
+    )
+    assert is_probable_revision_page(text) is True
+
+
+def test_revision_action_detects_modify_and_delete() -> None:
+    text = "\n".join(
+        [
+            "四、将第27.51条修改为：",
+            "二十、删去第27.1309条(d)款。",
+        ]
+    )
+    assert is_probable_revision_page(text) is True
+
+
+def test_revision_action_detects_annex_clause_modify() -> None:
+    # "三十一、将附件B第v条(a)款修改为：" —— 条款号前带"附件X"前缀。
+    text = "三十一、将附件B第v条(a)款修改为："
+    assert is_probable_revision_page(text) is True
+
+
+def test_revision_page_detects_quote_wrapped_continuation() -> None:
+    # 修订决定的复述续页没有动作句式，只有整页引号复述的条款全文。
+    lines = [
+        "“(1)临界重量；",
+        "“(2)临界重心；",
+        "“(3)最大连续功率；",
+        "“(4)起落架收起；",
+        "“(5)在Vy配平旋翼航空器。",
+    ]
+    assert is_probable_revision_page("\n".join(lines)) is True
+
+
+def test_revision_page_detects_lower_quote_ratio_continuation() -> None:
+    # 修订续页混入不带引号的跨页续行时，引号比例可低至 0.3 左右（CCAR-27
+    # 修订决定第 11 页实测约 0.30），仍应识别为修订续页。
+    lines = [
+        "件变化的影响。每一申请人必须评定包括机体PSE、主/尾旋翼传动系统……",
+        "件变化的影响。每一申请人必须评定包括机体PSE、主/尾旋翼传动系统……",
+        "件变化的影响。每一申请人必须评定包括机体PSE、主/尾旋翼传动系统……",
+        "“(i)确定所有的 PSE;",
+        "“(ii)用于确定所有 PSE 的载荷或应力……",
+        "“(iii)以本条(d)(1)(ii)确定的载荷或应力为基础……",
+        "件变化的影响。每一申请人必须评定包括机体PSE、主/尾旋翼传动系统……",
+    ]
+    assert is_probable_revision_page("\n".join(lines)) is True
+
+
+def test_revision_page_ignores_few_quote_lines() -> None:
+    # 只有一两行引号不足以判定为修订续页，避免误伤正文里的零星引用。
+    text = "\n".join(
+        [
+            "“第27.573条 复合材料旋翼航空器结构的损伤容限和疲劳评定",
+            "本条规定的损伤容限评定不切实际时，才进行疲劳评定。",
+            "申请人必须按本条(e)进行疲劳评定。",
+        ]
+    )
+    assert is_probable_revision_page(text) is False
+
+
+def test_revision_page_ignores_quote_wrapped_math_variables() -> None:
+    # 正文里用引号标记数学变量/坐标（如航空灯色度坐标 "X"、"Y"、"Z"）的页，
+    # 引号后紧跟 ASCII 字母，不是修订复述，不应被误判。
+    text = "\n".join(
+        [
+            "“Z”不大于0.002。",
+            "(b)航空绿色",
+            "“X”不大于0.440—0.320Y;",
+            "“X”不大于 Y—0.170;",
+            "“Y”不小于0.390—0.170X。",
+            "(c)航空白色",
+            "“X”不小于0.300且不大于0.540;",
+            "“Y”不小于“X—0.040”或“Yc—0.010”,取小者;",
+            "“Y”不大于“X+0.020”也不大于“0.636—0.400X”。",
+        ]
+    )
+    assert is_probable_revision_page(text) is False
+
+
+def test_revision_page_ignores_normal_clause_body() -> None:
+    # 正文条款页行首不带引号，也没有修订动作，不应被误判。
+    text = "\n".join(
+        [
+            "第27.571条 飞行结构的疲劳评定",
+            "(a)总则飞行结构的每一部分……必须予以认定，并必须按本节规定进行评定。",
+            "(1)评定的方法必须是经批准的。",
+            "(2)必须确定可能破坏的部位。",
+        ]
+    )
+    assert is_probable_revision_page(text) is False
+
+
+def test_revision_page_ignores_article_reference_in_body() -> None:
+    # 正文引用"按照第27.573条"不含修订动作，不应被误判。
+    text = "申请人必须按照第27.573条(d)款的规定进行损伤容限评定。"
+    assert is_probable_revision_page(text) is False

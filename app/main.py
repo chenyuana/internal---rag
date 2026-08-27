@@ -15,6 +15,8 @@ from app.core.logging import configure_logging
 from app.core.middleware import RequestContextMiddleware
 from app.ingestion.jobs import IngestionJobService
 from app.pipelines.rag_pipeline import RagPipeline
+from app.services.performance_monitor import PerformanceMonitor
+from app.services.ragas_evaluator import RagasTaskManager
 from app.services.registry import ServiceRegistry
 from app.services.retrieval_service import RetrievalService
 
@@ -27,6 +29,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.settings = resolved_settings
+        application.state.performance_monitor = PerformanceMonitor()
+        application.state.ragas_manager = RagasTaskManager(resolved_settings.ragas)
         application.state.ingestion_service = IngestionJobService(
             resolved_settings.ingestion,
             ragflow_settings=resolved_settings.ragflow,
@@ -41,6 +45,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings=resolved_settings,
             retrieval=application.state.retrieval_service,
             answer_model=application.state.services.answer_model_client,
+            answer_models=application.state.services.answer_model_manager,
         )
         try:
             yield
@@ -63,11 +68,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.get("/ingestion", include_in_schema=False)
     async def ingestion_interface() -> FileResponse:
-        return FileResponse(web_root / "ingestion.html")
+        return FileResponse(
+            web_root / "ingestion.html", headers={"Cache-Control": "no-store"}
+        )
 
     @application.get("/chat", include_in_schema=False)
     async def chat_interface() -> FileResponse:
-        return FileResponse(web_root / "chat.html")
+        return FileResponse(web_root / "chat.html", headers={"Cache-Control": "no-store"})
+
+    @application.get("/documents", include_in_schema=False)
+    async def document_workbench_interface() -> FileResponse:
+        return FileResponse(
+            web_root / "documents.html", headers={"Cache-Control": "no-store"}
+        )
+
+    @application.get("/evaluation", include_in_schema=False)
+    async def evaluation_interface() -> FileResponse:
+        return FileResponse(
+            web_root / "evaluation.html", headers={"Cache-Control": "no-store"}
+        )
+
+    @application.get("/monitor", include_in_schema=False)
+    async def monitor_interface() -> FileResponse:
+        return FileResponse(
+            web_root / "monitor.html", headers={"Cache-Control": "no-store"}
+        )
 
     application.add_middleware(RequestContextMiddleware)
     register_exception_handlers(application)

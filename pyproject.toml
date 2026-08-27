@@ -56,3 +56,25 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 python_version = "3.11"
 strict = true
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# Third-party evaluation stack without type stubs (ragas/langchain/datasets).
+module = [
+    "ragas.*",
+    "datasets.*",
+    "langchain_ollama.*",
+    "langchain.*",
+    "langchain_core.*",
+    "langchain_community.*",
+    "langchain_text_splitters.*",
+    "ollama.*",
+    "openai.*",
+    "tiktoken.*",
+    "langsmith.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# numpy 2.5 stubs use Python 3.12 `type` statements; mypy targets 3.11 here.
+module = ["numpy.*"]
+ignore_errors = true

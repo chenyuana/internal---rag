@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from app.core.config import ModelEndpointSettings, Settings
 from app.schemas.health import ServiceStatus
+from app.services.answer_model_manager import AnswerModelManager
 from app.services.model_client import OpenAICompatibleModelClient
 from app.services.probe import ProbeResult
 from app.services.ragflow_client import RagflowClient
@@ -25,10 +26,12 @@ class ServiceRegistry:
         settings: Settings,
         ragflow_client: RagflowClient | None,
         models: list[RegisteredModel],
+        answer_model_manager: AnswerModelManager,
     ) -> None:
         self._settings = settings
         self._ragflow_client = ragflow_client
         self._models = models
+        self._answer_model_manager = answer_model_manager
 
     @classmethod
     def from_settings(cls, settings: Settings) -> ServiceRegistry:
@@ -48,7 +51,12 @@ class ServiceRegistry:
             else:
                 client = OpenAICompatibleModelClient(model_settings)
             models.append(RegisteredModel(name=name, settings=model_settings, client=client))
-        return cls(settings=settings, ragflow_client=ragflow_client, models=models)
+        return cls(
+            settings=settings,
+            ragflow_client=ragflow_client,
+            models=models,
+            answer_model_manager=AnswerModelManager(settings.models.answer),
+        )
 
     @property
     def ragflow_client(self) -> RagflowClient | None:
@@ -70,6 +78,20 @@ class ServiceRegistry:
             ):
                 return model.client
         return None
+
+    @property
+    def verifier_model_client(self) -> OpenAICompatibleModelClient | None:
+        for model in self._models:
+            if model.name == "verifier" and isinstance(
+                model.client,
+                OpenAICompatibleModelClient,
+            ):
+                return model.client
+        return None
+
+    @property
+    def answer_model_manager(self) -> AnswerModelManager:
+        return self._answer_model_manager
 
     @staticmethod
     def _disabled(name: str, required: bool) -> ServiceStatus:

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import copy
+import json
 import time
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -78,12 +79,11 @@ def flatten_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
     _lift_required(flattened)
 
-    return flattened
-
+    return cast(dict[str, Any], flattened)
 
 
 class OpenAICompatibleModelClient:
-    """OpenAI-compatible model service adapter used by all configured local models."""
+    """Adapter for configured local or runtime OpenAI-compatible models."""
 
     def __init__(
         self,
@@ -96,7 +96,9 @@ class OpenAICompatibleModelClient:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         self.model_name = settings.model_name
+        self._uses_deepseek_v4_thinking = settings.model_name.startswith("deepseek-v4-")
         self.temperature = settings.temperature
+        self.seed = settings.seed
         self.max_output_tokens = settings.max_output_tokens
         self._client = httpx.AsyncClient(
             base_url=settings.base_url.rstrip("/") + "/",
@@ -132,6 +134,32 @@ class OpenAICompatibleModelClient:
                 detail=type(exc).__name__,
             )
 
+    async def list_models(self) -> list[str]:
+        """Return model ids from an OpenAI-compatible ``GET /models`` endpoint."""
+        try:
+            response = await self._client.get("models")
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data", [])
+            if not isinstance(data, list):
+                raise TypeError("model list is not an array")
+            return list(
+                dict.fromkeys(
+                    item["id"]
+                    for item in data
+                    if isinstance(item, dict)
+                    and isinstance(item.get("id"), str)
+                    and item["id"].strip()
+                )
+            )
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            raise AppError(
+                code="MODEL_CATALOG_UNAVAILABLE",
+                message="The model service did not return a valid model catalog.",
+                status_code=503,
+                details={"error_type": type(exc).__name__},
+            ) from exc
+
     async def chat_completion(
         self,
         *,
@@ -140,12 +168,11 @@ class OpenAICompatibleModelClient:
     ) -> str:
         """Request strict JSON from a local OpenAI-compatible chat endpoint."""
         flattened_schema = flatten_json_schema(response_schema)
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model_name,
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_output_tokens,
-            "reasoning_effort": "none",
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -155,11 +182,20 @@ class OpenAICompatibleModelClient:
                 },
             },
         }
+        if self._uses_deepseek_v4_thinking:
+            # DeepSeek V4 enables thinking by default. Its Chat Completions API
+            # uses this object (rather than Ollama's ``think`` boolean) to turn
+            # reasoning off, so the bounded output budget is reserved for the
+            # required structured final answer.
+            payload["thinking"] = {"type": "disabled"}
+        else:
+            payload["reasoning_effort"] = "none"
+        if self.seed is not None:
+            payload["seed"] = self.seed
         try:
-            response = await self._client.post("chat/completions", json=payload)
-            response.raise_for_status()
+            response = await self._post_chat_payload(payload)
             body = response.json()
-            content = body["choices"][0]["message"]["content"]
+            message = body["choices"][0]["message"]
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
             raise AppError(
                 code="ANSWER_MODEL_UNAVAILABLE",
@@ -167,6 +203,62 @@ class OpenAICompatibleModelClient:
                 status_code=503,
                 details={"error_type": type(exc).__name__},
             ) from exc
+        content = self._message_text(message)
+        if content is not None:
+            return content
+
+        # A provider can return HTTP 200 with an empty final ``content`` (for
+        # example, after spending the token budget on hidden reasoning). Retry
+        # once with thinking explicitly disabled and without a fixed seed. The
+        # normal compatibility path removes provider-specific parameters and
+        # falls back from json_schema to json_object when necessary.
+        recovery = copy.deepcopy(payload)
+        recovery.pop("seed", None)
+        if self._uses_deepseek_v4_thinking:
+            recovery["thinking"] = {"type": "disabled"}
+        else:
+            recovery["think"] = False
+        recovery_messages = copy.deepcopy(recovery["messages"])
+        recovery_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "The previous attempt returned no final content. Return only "
+                    "the required JSON object now, without analysis or explanation."
+                ),
+            }
+        )
+        recovery["messages"] = recovery_messages
+        try:
+            recovery_response = await self._post_chat_payload(recovery)
+            recovery_body = recovery_response.json()
+            recovery_message = recovery_body["choices"][0]["message"]
+            recovered = self._message_text(recovery_message)
+            if recovered is not None:
+                return recovered
+        except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
+            raise AppError(
+                code="ANSWER_MODEL_UNAVAILABLE",
+                message="The selected answer model recovery request failed.",
+                status_code=503,
+                details={"error_type": type(exc).__name__},
+            ) from exc
+        raise AppError(
+            code="ANSWER_MODEL_INVALID_RESPONSE",
+            message="The selected answer model returned empty content.",
+            status_code=502,
+            details={
+                "finish_reason": body.get("choices", [{}])[0].get("finish_reason"),
+                "reasoning_content_present": bool(message.get("reasoning_content")),
+                "empty_recovery_attempted": True,
+            },
+        )
+
+    @staticmethod
+    def _message_text(message: object) -> str | None:
+        if not isinstance(message, dict):
+            return None
+        content = message.get("content")
         if isinstance(content, str) and content.strip():
             return content
         if isinstance(content, list):
@@ -177,11 +269,52 @@ class OpenAICompatibleModelClient:
             )
             if text.strip():
                 return text
-        raise AppError(
-            code="ANSWER_MODEL_INVALID_RESPONSE",
-            message="The local answer model returned empty content.",
-            status_code=502,
+        return None
+
+    async def _post_chat_payload(self, payload: dict[str, Any]) -> httpx.Response:
+        """Use strict schema first, then retry a portable strict variant.
+
+        Some OpenAI-compatible APIs reject optional parameters such as
+        ``reasoning_effort`` or ``seed`` while still supporting JSON Schema. Keep
+        the schema on the first compatibility retry. Only then fall back to
+        ``json_object``, with the complete schema embedded in the prompt so the
+        provider still knows every required field. Never fall back to unconstrained
+        plain text for a response that the application treats as verified JSON.
+        """
+        attempts = [payload]
+        portable_strict = copy.deepcopy(payload)
+        portable_strict.pop("reasoning_effort", None)
+        portable_strict.pop("seed", None)
+        portable_strict.pop("think", None)
+        attempts.append(portable_strict)
+
+        compatible = copy.deepcopy(portable_strict)
+        schema = compatible["response_format"]["json_schema"]["schema"]
+        compatible["response_format"] = {"type": "json_object"}
+        schema_instruction = (
+            "Return exactly one JSON object matching the following JSON Schema. "
+            "Every property listed in required must be present. Do not omit arrays "
+            "such as claims, missing_information, conflicts, or citation_ids. Do "
+            "not add properties. JSON Schema: "
+            + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
         )
+        messages = copy.deepcopy(compatible["messages"])
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = f"{messages[0]['content']}\n\n{schema_instruction}"
+        else:
+            messages.insert(0, {"role": "system", "content": schema_instruction})
+        compatible["messages"] = messages
+        attempts.append(compatible)
+        last_response: httpx.Response | None = None
+        for attempt in attempts:
+            response = await self._client.post("chat/completions", json=attempt)
+            last_response = response
+            if response.status_code not in {400, 422}:
+                response.raise_for_status()
+                return response
+        assert last_response is not None
+        last_response.raise_for_status()
+        return last_response
 
     async def close(self) -> None:
         await self._client.aclose()

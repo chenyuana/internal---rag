@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>文档编制 · Internal RAG</title>
+    <meta name="description" content="基于内部知识库证据的长文档编制工作台" />
+    <link rel="stylesheet" href="/assets/documents.css?v=20260827-4" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/documents" aria-label="文档编制工作台首页"><span class="brand-mark">IR</span><span><strong>Internal RAG</strong><small>证据驱动的专业文档编制</small></span></a>
+      <nav class="main-nav" aria-label="主导航"><a class="nav-tab" href="/ingestion">资料接入台</a><a class="nav-tab" href="/chat">智能问答</a><a class="nav-tab active" href="/documents" aria-current="page">文档编制</a><a class="nav-tab" href="/evaluation">评测结果</a><a class="nav-tab" href="/monitor">运行监控</a></nav>
+      <span class="service-pill" id="servicePill" aria-live="polite">正在读取知识库…</span>
+    </header>
+
+    <main class="workbench" id="workbench">
+      <aside class="project-rail" aria-label="文档项目">
+        <button class="new-project" id="newProject" type="button"><span>＋</span> 新建文档</button>
+        <div class="rail-heading"><span>文档项目</span><small id="projectCount">0</small></div>
+        <div class="project-list" id="projectList"></div>
+        <p class="storage-note">草稿保存在当前浏览器中</p>
+      </aside>
+
+      <section class="outline-panel" aria-labelledby="outlineTitle">
+        <div class="panel-head outline-head"><div><p class="eyebrow">DOCUMENT MAP</p><h1 id="outlineTitle">文档大纲</h1><p class="outline-hint">点击标题直接修改</p></div><div class="outline-tools"><button class="outline-add" id="generateGuidance" type="button" aria-label="为全部章节生成编制要求">编制要求</button><button class="outline-add" id="addSection" type="button" aria-label="新增章节"><span>＋</span>章节</button></div></div>
+        <div class="progress-card"><div class="progress-copy"><span id="progressText">0 / 0 节完成</span><strong id="progressPercent">0%</strong></div><div class="progress-track"><span id="progressBar"></span></div></div>
+        <div class="outline-list" id="outlineList"></div>
+      </section>
+
+      <section class="editor-shell">
+        <div class="editor-toolbar">
+          <div><p class="eyebrow">AUTHORING CANVAS</p><strong id="editorBreadcrumb">项目设置</strong></div>
+          <div class="toolbar-actions"><span class="save-state" id="saveState">已保存</span><button class="secondary-button" id="exportDraft" type="button">导出草稿</button></div>
+        </div>
+
+        <div class="editor-scroll">
+          <section class="setup-view" id="setupView">
+            <div class="setup-hero"><span class="hero-mark">文</span><div><p class="eyebrow">LONG-FORM AUTHORING</p><h2>先定义任务，再按章节组织证据</h2><p>结构文件生成初始大纲，证据资料只支持事实。两类附件不会混入同一角色。</p></div></div>
+
+            <div class="form-grid">
+              <label class="field field-wide"><span>文档名称</span><input id="documentTitle" maxlength="160" placeholder="例如：无人机适航要求及符合性验证文档" /></label>
+              <label class="field field-wide"><span>编制目标</span><textarea id="documentObjective" rows="4" maxlength="2000" placeholder="说明文档用途、需要解决的问题和内容深度要求"></textarea></label>
+              <label class="field"><span>使用对象</span><input id="documentAudience" maxlength="100" placeholder="例如：适航审定与研发团队" /></label>
+              <label class="field"><span>目标篇幅</span><select id="targetLength"><option value="brief">精简（约 3,000 字）</option><option value="standard" selected>标准（约 8,000 字）</option><option value="detailed">详细（约 15,000 字）</option></select></label>
+              <label class="field"><span>文档类型 / 预设大纲</span><select id="documentType"><option value="auto">智能推荐</option><option value="airworthiness">适航符合性文档</option><option value="test-plan">试验大纲 / 验证计划</option><option value="technical-report">技术报告</option><option value="generic">通用专业文档</option></select></label>
+              <label class="field"><span>知识库证据范围</span><select id="kbSelect"><option value="">加载中…</option></select></label>
+              <label class="field"><span>章节生成模型</span><div class="model-picker"><select id="modelSelect"><option value="">加载中…</option></select><button class="secondary-button" id="openModelDialog" type="button">接入 API</button></div></label>
+            </div>
+
+            <div class="source-grid">
+              <article class="source-card template-card">
+                <div class="source-title"><span class="source-icon">版</span><div><h3>结构文件 / 格式模板</h3><p>上传结构文件可直接生成初始大纲；未识别章节时仅保存为格式模板</p></div></div>
+                <input id="templateFile" type="file" accept=".docx,.pdf,.txt,.md,.markdown" hidden />
+                <button class="upload-zone" id="chooseTemplate" type="button"><strong>上传结构文件或格式模板</strong><span>支持 DOCX、PDF、TXT、Markdown；识别“1.范围；2.…”编号章节</span></button>
+                <div class="file-list" id="templateList"></div>
+              </article>
+              <article class="source-card evidence-card">
+                <div class="source-title"><span class="source-icon">据</span><div><h3>补充证据</h3><p>参与事实生成与引用；不会改变文档版式</p></div></div>
+                <input id="evidenceFiles" type="file" accept=".docx,.pdf,.txt,.md,.markdown" multiple hidden />
+                <button class="upload-zone" id="chooseEvidence" type="button"><strong>上传补充资料</strong><span>可多选；知识库仍是主要证据来源</span></button>
+                <div class="file-list" id="evidenceList"></div>
+              </article>
+            </div>
+
+            <div class="boundary-note"><strong>角色边界</strong><span>结构文件/格式模板不会出现在引用列表；补充证据不会覆盖页面、字体或标题样式。</span></div>
+            <div class="setup-actions"><span class="form-message" id="formMessage" role="status"></span><button class="primary-button" id="buildOutline" type="button">加载预设大纲</button></div>
+          </section>
+
+          <section class="section-view" id="sectionView" hidden>
+            <div class="section-heading-row"><label class="section-title-field"><span>章节标题</span><input id="sectionTitle" maxlength="140" /></label><label class="status-field"><span>编制状态</span><select id="sectionStatus"><option value="pending">待编制</option><option value="drafting">编制中</option><option value="complete">已完成</option></select></label></div>
+            <div class="section-instruction"><label class="guidance-field"><strong>本节编制要求</strong><textarea id="sectionGuidance" rows="3" maxlength="2000" placeholder="说明本章应覆盖的专业内容、边界、证据及输出要求"></textarea><small>可按项目实际情况修改，生成正文时将严格使用这里的要求。</small><button class="secondary-button" id="optimizeGuidance" type="button">优化本节</button></label><button class="generate-button" id="generateSection" type="button">检索证据并生成本节</button></div>
+            <label class="editor-field"><span>章节正文</span><textarea id="sectionContent" spellcheck="false" placeholder="在此编写或粘贴本节正文。事实性内容请保留 [C1] 形式的知识库引用。"></textarea></label>
+            <div class="section-footer"><span><span id="sectionStats">0 字 · 0 条引用</span><span class="generation-state" id="generationState"></span></span><button class="danger-button" id="deleteSection" type="button">删除本节</button></div>
+          </section>
+        </div>
+      </section>
+
+      <aside class="review-panel" aria-labelledby="reviewTitle">
+        <div class="panel-head"><div><p class="eyebrow">EVIDENCE & QA</p><h2 id="reviewTitle">引用与缺失检查</h2></div><span class="qa-score" id="qaScore">0</span></div>
+        <div class="summary-card"><span>当前草稿</span><strong id="totalStats">0 字 · 0 条引用</strong><small id="coverageStats">尚未建立大纲</small></div>
+        <section class="review-section"><h3>资料角色</h3><div class="role-row"><span class="role-dot template"></span><div><strong>格式模板</strong><small id="templateSummary">未上传</small></div></div><div class="role-row"><span class="role-dot evidence"></span><div><strong>事实证据</strong><small id="evidenceSummary">知识库加载中</small></div></div></section>
+        <section class="review-section"><h3>当前章节引用</h3><div class="section-evidence" id="sectionEvidence"><p>生成章节后在这里核对引用与缺失信息。</p></div></section>
+        <section class="review-section"><h3>质量门禁</h3><ul class="check-list" id="checkList"></ul></section>
+        <section class="review-section"><h3>下一步</h3><p class="next-step" id="nextStep">填写文档名称和编制目标，然后生成大纲。</p></section>
+      </aside>
+    </main>
+
+    <dialog id="confirmDialog"><form method="dialog" class="dialog-card"><h2>删除文档项目？</h2><p>项目及其本地草稿将被删除，且无法恢复。</p><div><button value="cancel" class="secondary-button">取消</button><button value="confirm" class="danger-button">确认删除</button></div></form></dialog>
+    <dialog id="modelDialog" aria-labelledby="modelDialogTitle"><form class="dialog-card model-dialog-card" id="modelConnectionForm"><div class="dialog-head"><div><p class="eyebrow">MODEL CONNECTION</p><h2 id="modelDialogTitle">接入章节生成模型 API</h2></div><button class="icon-button" id="closeModelDialog" type="button" aria-label="关闭">×</button></div><p>连接支持 OpenAI 兼容协议的模型服务。API Key 仅保存在当前网关进程内存中。</p><label class="field"><span>连接名称</span><input id="connectionName" maxlength="80" required placeholder="例如：内部推理服务" /></label><label class="field"><span>API Base URL</span><input id="connectionBaseUrl" type="url" required placeholder="https://example.com/v1" /></label><label class="field"><span>API Key</span><input id="connectionApiKey" type="password" autocomplete="off" placeholder="没有鉴权时可留空" /></label><p class="dialog-message" id="connectionMessage" role="status"></p><div class="dialog-actions"><button class="secondary-button" id="cancelModelConnection" type="button">取消</button><button class="primary-button" id="connectModelButton" type="submit">连接并读取模型</button></div></form></dialog>
+    <script src="/assets/outline_parser.js?v=20260827-3" defer></script>
+    <script src="/assets/documents.js?v=20260827-3" defer></script>
+  </body>
+</html>

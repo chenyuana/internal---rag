@@ -76,7 +76,11 @@ class CitationValidator:
             chunk = chunk_by_citation.get(citation_id)
             if chunk is None:
                 raise ValueError(f"citation {citation_id} has no backend chunk mapping")
-            if not include_historical and chunk.metadata.status is not None and chunk.metadata.status != "effective":
+            if (
+                not include_historical
+                and chunk.metadata.status is not None
+                and chunk.metadata.status != "effective"
+            ):
                 raise ValueError(f"citation {citation_id} is not from an effective document")
 
     @staticmethod

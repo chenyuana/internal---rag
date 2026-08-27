@@ -33,3 +33,17 @@ def test_cross_document_dual_requirement_is_multi_hop() -> None:
 def test_dual_requirement_marker_is_multi_hop() -> None:
     result = QueryAnalyzer().analyze("项目实施需要兼顾安全与效率两方面要求？")
     assert result.query_type == "multi_hop"
+
+
+def test_tongchou_qufen_three_stage_question_is_comparison() -> None:
+    """"…三个环节的标准要求如何统筹区分"是两两比较题，不得被"如何"误判为 procedure。"""
+    result = QueryAnalyzer().analyze(
+        "长大桥梁无人机精细化巡检与地质灾害倾斜摄影测量，"
+        "在设备选型、像控布设、成果验收三个环节的标准要求如何统筹区分"
+    )
+    assert result.query_type == "comparison"
+
+
+def test_qubie_and_tongyi_are_comparison() -> None:
+    assert QueryAnalyzer().analyze("A型无人机和B型无人机有什么区别？").query_type == "comparison"
+    assert QueryAnalyzer().analyze("两种巡检方式的异同有哪些？").query_type == "comparison"

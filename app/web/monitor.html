@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>运行监控 · Internal RAG</title>
+    <meta name="description" content="实时查看系统问答性能与服务健康状态" />
+    <link rel="stylesheet" href="/assets/monitor.css?v=20260827-2" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/monitor" aria-label="运行监控首页">
+        <span class="brand-mark">IR</span>
+        <span><strong>Internal RAG</strong><small>实时性能监控</small></span>
+      </a>
+      <nav class="main-nav" aria-label="主导航">
+        <a class="nav-tab" href="/ingestion">资料接入台</a>
+        <a class="nav-tab" href="/chat">智能问答</a>
+        <a class="nav-tab" href="/documents">文档编制</a>
+        <a class="nav-tab" href="/evaluation">评测结果</a>
+        <a class="nav-tab active" href="/monitor" aria-current="page">运行监控</a>
+      </nav>
+      <span class="service-pill" id="storeStatus">正在读取监控…</span>
+    </header>
+
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">LIVE OBSERVATORY</p>
+          <h1>运行监控</h1>
+          <p>每 3 秒自动刷新。数据来自内存滑动窗口（重启网关即清空），仅统计智能问答链路请求。</p>
+        </div>
+        <div class="hero-controls">
+          <label class="window-picker">
+            <span>窗口</span>
+            <select id="windowSelect">
+              <option value="5">最近 5 分钟</option>
+              <option value="15" selected>最近 15 分钟</option>
+              <option value="30">最近 30 分钟</option>
+              <option value="0">全部（内存缓存）</option>
+            </select>
+          </label>
+          <span class="refresh-hint" id="refreshHint">自动刷新中</span>
+        </div>
+      </section>
+
+      <section class="state-card" id="emptyState" hidden>
+        <strong>还没有监控数据</strong>
+        <span>去「智能问答」提问几轮，这里会实时出现统计；或等服务产生请求后自动出现。</span>
+      </section>
+
+      <section class="card ragas-card" id="ragasCard">
+        <div class="section-title ragas-head">
+          <div>
+            <p class="eyebrow">RAGAS CALIBRATION</p>
+            <h2>RAGAS 校准评测</h2>
+            <p class="ragas-lead">用独立判题模型校准回答忠实度、相关性和检索质量。</p>
+          </div>
+          <span class="ragas-status" id="ragasStatus">检测中…</span>
+        </div>
+        <div class="ragas-mode-tabs" role="tablist" aria-label="评测方式">
+          <button class="ragas-mode-tab active" type="button" data-ragas-mode="question" role="tab" aria-selected="true"><strong>单题评测</strong><span>快速检查一条问答</span></button>
+          <button class="ragas-mode-tab" type="button" data-ragas-mode="benchmark" role="tab" aria-selected="false"><strong>批量校准</strong><span>从基准题集中选择用例</span></button>
+        </div>
+        <div class="ragas-workspace">
+          <div class="ragas-config">
+            <section class="ragas-step">
+              <div class="ragas-step-title"><span>1</span><div><strong>选择评测内容</strong><small id="ragasModeHint">输入问题，系统将先生成回答与引用证据。</small></div></div>
+              <div id="questionPanel">
+                <label class="ragas-field"><span>评测问题</span><textarea id="ragasQuestion" rows="3" maxlength="2000" placeholder="例如：CCAR-25 对持续适航文件有哪些要求？" aria-label="要评测的问题"></textarea></label>
+                <label class="ragas-field"><span>标准答案 <em>可选</em></span><textarea id="ragasGroundTruth" rows="2" placeholder="填写后可计算上下文精确率和召回率"></textarea><small id="groundTruthHint">留空时仅计算忠实度和答案相关性。</small></label>
+              </div>
+              <div id="benchmarkPanel" hidden>
+                <div class="benchmark-toolbar"><input id="ragasBenchmarkSearch" class="text-input" placeholder="搜索题目、类别或编号" /></div>
+                <div class="benchmark-summary"><label><input type="checkbox" id="ragasBenchmarkAll" checked /> 使用全部可评测用例</label><span id="ragasBenchmarkCount">正在读取题集…</span></div>
+                <div class="benchmark-list" id="ragasBenchmarkList"></div>
+              </div>
+            </section>
+            <section class="ragas-step">
+              <div class="ragas-step-title"><span>2</span><div><strong>确认评测配置</strong><small>回答模型负责生成答案，判题模型只负责评分。</small></div></div>
+              <div class="ragas-config-grid">
+                <label class="window-picker"><span>知识库</span><select id="ragasKbSelect"><option value="">加载中…</option></select></label>
+                <button class="model-summary" id="openRagasSettings" type="button"><span>回答模型</span><strong id="ragasAnswerModelSummary">加载中…</strong></button>
+                <button class="model-summary" id="openRagasSettingsJudge" type="button"><span>判题模型</span><strong id="ragasJudgeModelSummary">加载中…</strong></button>
+              </div>
+            </section>
+          </div>
+          <aside class="ragas-run-card">
+            <div class="ragas-step-title"><span>3</span><div><strong>运行评测</strong><small>启动前请核对以下配置。</small></div></div>
+            <dl class="ragas-run-summary"><div><dt>评测方式</dt><dd id="ragasRunModeSummary">单题评测</dd></div><div><dt>用例数量</dt><dd id="ragasRunCountSummary">1 条</dd></div><div><dt>可计算指标</dt><dd id="ragasMetricScope">2 / 4 项</dd></div></dl>
+            <button class="ragas-btn primary-wide" id="ragasRunBtn" type="button">开始评测</button>
+            <button class="ragas-btn ghost primary-wide" id="ragasCancelBtn" type="button" hidden>取消任务</button>
+          </aside>
+        </div>
+        <div class="ragas-progress" id="ragasProgress" hidden><div class="ragas-progress-copy"><strong id="ragasProgressStage">准备评测</strong><span id="ragasProgressText">—</span></div><div class="bar-track"><div class="bar-fill" id="ragasProgressFill" style="width:0%"></div></div><div class="ragas-stage-list"><span data-stage="answer">生成回答</span><span data-stage="context">整理上下文</span><span data-stage="judge">RAGAS 判题</span><span data-stage="summary">汇总结果</span></div></div>
+        <div class="ragas-feedback" id="ragasNote">准备就绪。单题模式填写标准答案后可计算全部四项指标。</div>
+        <section class="ragas-results" id="ragasResults">
+          <div class="ragas-result-head"><div><p class="eyebrow">RESULT SUMMARY</p><h3>评测结果</h3></div><small id="ragasResultMeta">尚未运行</small></div>
+          <div class="ragas-metrics" id="ragasMetrics"></div>
+        </section>
+        <div class="ragas-case-tools" id="ragasCaseTools" hidden><strong>用例明细</strong><div><select id="ragasCaseFilter" aria-label="结果筛选"><option value="all">全部结果</option><option value="low">仅看低分</option><option value="error">仅看失败</option></select><input id="ragasCaseSearch" class="text-input" placeholder="搜索问题或用例编号" /></div></div>
+        <div class="table-wrap ragas-table-wrap" id="ragasTableWrap" hidden>
+          <table class="ragas-table">
+            <thead><tr><th>用例</th><th>问题</th><th>忠实度</th><th>相关性</th><th>精确率</th><th>召回率</th><th></th></tr></thead>
+            <tbody id="ragasRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <div id="dashboard" hidden>
+        <section class="run-head card">
+          <div>
+            <p class="eyebrow">SERVICES</p>
+            <h2>服务健康状态</h2>
+            <p id="servicesMeta">正在探测各依赖服务…</p>
+          </div>
+          <div class="service-grid" id="serviceGrid"></div>
+        </section>
+
+        <section class="metric-grid" id="metricGrid" aria-label="核心指标"></section>
+
+        <section class="card detail-card">
+          <div class="section-title">
+            <div><p class="eyebrow">STAGE TIMINGS</p><h2>阶段耗时（成功请求平均）</h2></div>
+          </div>
+          <div class="bars" id="stageBars"></div>
+        </section>
+
+        <section class="grid-two">
+          <section class="card detail-card">
+            <div class="section-title">
+              <div><p class="eyebrow">ERRORS</p><h2>错误分布</h2></div>
+            </div>
+            <div class="bars" id="errorBars"></div>
+          </section>
+          <section class="card detail-card">
+            <div class="section-title">
+              <div><p class="eyebrow">ANSWERABILITY</p><h2>回答状态分布</h2></div>
+            </div>
+            <div class="bars" id="statusBars"></div>
+          </section>
+        </section>
+
+        <section class="card">
+          <div class="section-title">
+            <div><p class="eyebrow">RECENT REQUESTS</p><h2>最近请求</h2></div>
+            <span class="section-note" id="recentNote">—</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>时间</th><th>结果</th><th>问题</th><th>状态 / 错误</th><th>耗时</th><th>模型调用</th><th>检索</th></tr></thead>
+              <tbody id="recentRows"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <dialog class="model-dialog" id="ragasSettingsDialog" aria-labelledby="ragasSettingsTitle">
+      <form class="model-dialog-card ragas-settings-card" method="dialog">
+        <div class="dialog-head"><div><p class="eyebrow">EVALUATION MODELS</p><h2 id="ragasSettingsTitle">评测模型设置</h2></div><button class="icon-button" id="closeRagasSettings" value="cancel" aria-label="关闭">×</button></div>
+        <div class="model-role-note"><strong>回答模型</strong><span>通过知识库检索生成待评测答案和引用。</span></div>
+        <label class="field"><span>回答模型</span><select id="ragasAnswerModelSelect"><option value="">加载中…</option></select></label>
+        <div class="model-role-note"><strong>判题模型</strong><span>读取答案、上下文和标准答案并计算 RAGAS 指标。</span></div>
+        <label class="field"><span>判题模型</span><select id="ragasModelSelect"><option value="">加载中…</option></select></label>
+        <div class="settings-connection-row"><button class="ragas-btn ghost" id="openRagasApiDialog" type="button">接入 API</button><button class="ragas-btn ghost danger-text" id="removeRagasApi" type="button" hidden>移除当前连接</button></div>
+        <p class="dialog-description">API 连接只在当前网关进程内生效，重启后自动恢复默认配置。</p>
+        <div class="dialog-actions"><button class="ragas-btn" value="confirm">完成</button></div>
+      </form>
+    </dialog>
+
+    <dialog class="model-dialog" id="ragasApiDialog" aria-labelledby="ragasApiDialogTitle">
+      <form class="model-dialog-card" id="ragasApiForm">
+        <div class="dialog-head">
+          <div><p class="eyebrow">RAGAS JUDGE API</p><h2 id="ragasApiDialogTitle">接入判题 API</h2></div>
+          <button class="icon-button" id="closeRagasApiDialog" type="button" aria-label="关闭">×</button>
+        </div>
+        <p class="dialog-description">连接 OpenAI 兼容服务，把它的模型加入回答模型和判题模型列表。API Key 仅保存在当前网关进程内存中。</p>
+        <label class="field"><span>连接名称</span><input id="ragasConnName" class="text-input" maxlength="80" placeholder="例如：DeepSeek 官方" /></label>
+        <label class="field"><span>API Base URL</span><input id="ragasApiBaseUrl" class="text-input" type="url" required placeholder="https://api.deepseek.com 或 https://example.com/v1" /></label>
+        <label class="field"><span>API Key</span><input id="ragasApiKey" class="text-input" type="password" autocomplete="off" placeholder="没有鉴权时可留空" /></label>
+        <label class="field"><span>模型列表（可选）</span><input id="ragasApiModels" class="text-input" placeholder="逗号分隔；留空则自动从 GET /models 获取" /></label>
+        <label class="field"><span>Embedding 模型（可选）</span><input id="ragasApiEmbedding" class="text-input" placeholder="留空则用本地 qwen3-embedding" /></label>
+        <p class="dialog-message" id="ragasApiMessage" role="status"></p>
+        <div class="dialog-actions">
+          <button class="ragas-btn ghost" id="cancelRagasApi" type="button">取消</button>
+          <button class="ragas-btn" id="connectRagasApiButton" type="submit">连接并应用</button>
+        </div>
+      </form>
+    </dialog>
+    <script src="/assets/monitor.js?v=20260827-2" defer></script>
+  </body>
+</html>

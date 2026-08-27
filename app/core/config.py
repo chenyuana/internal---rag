@@ -101,6 +101,7 @@ class ModelEndpointSettings(BaseModel):
     timeout_seconds: float = Field(default=30, gt=0)
     operation_path: str | None = None
     temperature: float = Field(default=0, ge=0, le=2)
+    seed: int | None = Field(default=None, ge=0)
     max_output_tokens: int = Field(default=1024, ge=1)
 
 
@@ -111,11 +112,47 @@ class ModelsSettings(BaseModel):
     reranker: ModelEndpointSettings
 
 
+class PlanningSettings(BaseModel):
+    enabled: bool = True
+    model_enabled: bool = False
+    model_role: Literal["verifier"] = "verifier"
+    timeout_seconds: float = Field(default=15, gt=0)
+    max_subqueries: int = Field(default=8, ge=1, le=8)
+    min_confidence: float = Field(default=0.75, ge=0, le=1)
+    use_deterministic_fast_path: bool = True
+    fallback_to_legacy: bool = True
+    shadow_mode: bool = True
+    diagnostics_enabled: bool = True
+    prompt_path: str = "prompts/query_planning.txt"
+    prompt_version: str = "query-planning-v1"
+
+
+class TranslationSettings(BaseModel):
+    enabled: bool = True
+    model_enabled: bool = False
+    trigger: Literal["low_confidence_only"] = "low_confidence_only"
+    timeout_seconds: float = Field(default=10, gt=0)
+    max_variants_per_cell: int = Field(default=1, ge=0, le=1)
+    max_total_translations: int = Field(default=4, ge=0, le=8)
+    min_original_results: int = Field(default=1, ge=0, le=20)
+    min_coverage_confidence: float = Field(default=0.55, ge=0, le=1)
+    preserve_original_query: bool = True
+    prompt_path: str = "prompts/query_translation.txt"
+    prompt_version: str = "query-translation-v1"
+
+
 class RetrievalSettings(BaseModel):
     candidate_top_k: int = Field(default=30, ge=1)
-    rerank_input_k: int = Field(default=30, ge=1)
+    rerank_input_k: int = Field(default=12, ge=1)
     rerank_top_k: int = Field(default=6, ge=1)
     max_final_chunks: int = Field(default=8, ge=1)
+    # 流程/汇总类问题（"完整操作流程包含哪些关键环节"）：需要覆盖从起点到
+    # 终点的各环节章节，名额和重排输入都放宽，并按章节多样性选择；同名多
+    # 规程（如省标+市标）时还要保证每份规程的流程章节都能进入（每份规程
+    # 按文档配额轮转，名额需 ≥ 每份规程的章节数×规程数）。
+    procedure_rerank_input_k: int = Field(default=22, ge=1, le=50)
+    procedure_rerank_top_k: int = Field(default=16, ge=1, le=30)
+    procedure_final_limit: int = Field(default=18, ge=1, le=30)
     similarity_threshold: float = Field(default=0.25, ge=0, le=1)
     vector_similarity_weight: float = Field(default=0.3, ge=0, le=1)
     allow_rerank_fallback: bool = False
@@ -125,23 +162,51 @@ class RetrievalSettings(BaseModel):
     enable_adjacent_context: bool = True
     max_adjacent_chunks: int = Field(default=1, ge=0)
     max_complex_subqueries: int = Field(default=12, ge=2, le=20)
-    complex_candidates_per_subquery: int = Field(default=2, ge=1, le=10)
-    complex_rerank_input_k: int = Field(default=12, ge=2, le=50)
+    complex_candidates_per_subquery: int = Field(default=8, ge=1, le=12)
+    complex_rerank_input_k: int = Field(default=20, ge=2, le=60)
+    # 对比/多跳矩阵的最终证据名额（对比矩阵每格需要 1~3 个 chunk 承载
+    # 各维度章节，如桥梁设备选型需同时含 4.3.2 无人机与 4.3.4 云台相机）。
+    complex_final_limit: int = Field(default=12, ge=4, le=24)
     complex_similarity_threshold: float = Field(default=0.15, ge=0, le=1)
+    min_rerank_score: float = Field(default=0.1, ge=0, le=1)
     complex_min_rerank_score: float = Field(default=0.1, ge=0, le=1)
+    # 问题显式限定"结合 A、B 两类…规程/规范"时（procedure/summary 类），只允许
+    # 属于声明类别的文档进入生成证据；范围内规程缺失的细节如实写"未明确说明"，
+    # 禁止用其它作物/领域规程内容顶替（如林地问题引用马铃薯规范）。
+    enforce_declared_scope: bool = True
+    max_parallel_ragflow_requests: int = Field(default=2, ge=1, le=8)
+    per_cell_candidate_top_k: int = Field(default=12, ge=1, le=50)
+    max_section_expansion_queries_per_cell: int = Field(default=2, ge=0, le=6)
+    fusion_rrf_k: int = Field(default=60, ge=1, le=200)
+    # 仅用于 weighted RRF 中 translated 排名的贡献，不与原始相似度相乘。
+    translated_query_weight: float = Field(default=0.85, gt=0, le=1)
 
 
 class GenerationSettings(BaseModel):
     require_citations: bool = True
     reject_on_no_evidence: bool = True
     allow_partial_answer: bool = True
-    json_repair_attempts: int = Field(default=1, ge=0, le=1)
+    enforce_scope_consistency: bool = True
+    enforce_claim_grounding: bool = True
+    enforce_subject_grounding: bool = True
+    enforce_claim_topic: bool = True
+    # 对比矩阵完整性：已覆盖的每个（主体×维度）格子必须在答案中出现，
+    # 缺失触发 repair（并允许第二轮回补），repair 后仍缺失则优雅降级。
+    enforce_comparison_completeness: bool = True
+    json_repair_attempts: int = Field(default=1, ge=0, le=2)
     max_evidence_sentences: int = Field(default=16, ge=1, le=100)
-    max_sentences_per_citation: int = Field(default=3, ge=1, le=10)
+    max_sentences_per_citation: int = Field(default=5, ge=1, le=10)
     min_evidence_overlap: float = Field(default=0.08, ge=0, le=1)
     answer_prompt_path: str = "prompts/answer_generation.txt"
     repair_prompt_path: str = "prompts/json_repair.txt"
-    prompt_version: str = "answer-generation-v1"
+    prompt_version: str = "answer-generation-v15"
+    document_section_prompt_path: str = "prompts/document_section_generation.txt"
+    document_section_prompt_version: str = "document-section-generation-v1"
+    comparison_matrix_first: bool = True
+    comparison_summary_enabled: bool = True
+    comparison_summary_timeout_seconds: float = Field(default=30, gt=0)
+    comparison_summary_max_attempts: int = Field(default=1, ge=0, le=1)
+    matrix_summary_prompt_path: str = "prompts/matrix_summary.txt"
 
 
 class LoggingSettings(BaseModel):
@@ -155,6 +220,46 @@ class LoggingSettings(BaseModel):
     mask_sensitive_data: bool = True
 
 
+class EvaluationSettings(BaseModel):
+    """Read-only access to reports produced by the sibling rag-evaluation project."""
+
+    enabled: bool = True
+    database_path: Path = Path("D:/internal-rag/temp/rag-eval-reports/runs.db")
+
+
+class RagasSettings(BaseModel):
+    """RAGAS calibration evaluation executed from the live monitor page.
+
+    The judge LLM and embeddings default to local Ollama models.  When the
+    ``api_model`` field is set, an OpenAI-compatible API endpoint is used for
+    the judge LLM instead (and ``api_embedding_model`` optionally switches the
+    embeddings too); leaving them empty keeps the fully-offline local path.
+    """
+
+    enabled: bool = True
+    judge_model: str = "qwen3:4b-instruct-2507-q4_K_M"
+    embedding_model: str = "qwen3-embedding:0.6b"
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    # OpenAI-compatible API backend (empty = use local Ollama).
+    api_base_url: str = ""
+    api_key: str = ""
+    api_model: str = ""
+    api_embedding_model: str = ""
+    benchmark_path: Path = Path(
+        "D:/internal-rag/source/rag-evaluation/datasets/benchmark.jsonl"
+    )
+    max_cases: int = Field(default=20, ge=1, le=100)
+    # Runtime-only override of the derived backend (set by the monitor UI).
+    # None = derive from ``api_model`` presence; never persisted to .env.
+    active_backend: Literal["api", "local"] | None = None
+
+    @property
+    def llm_backend(self) -> str:
+        if self.active_backend:
+            return self.active_backend
+        return "api" if self.api_model else "local"
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -166,8 +271,12 @@ class Settings(BaseModel):
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     access_control: AccessControlSettings = Field(default_factory=AccessControlSettings)
     models: ModelsSettings
+    planning: PlanningSettings = Field(default_factory=PlanningSettings)
+    translation: TranslationSettings = Field(default_factory=TranslationSettings)
     retrieval: RetrievalSettings
     generation: GenerationSettings = Field(default_factory=GenerationSettings)
+    evaluation: EvaluationSettings = Field(default_factory=EvaluationSettings)
+    ragas: RagasSettings = Field(default_factory=RagasSettings)
     logging: LoggingSettings
 
     def public_view(self) -> dict[str, object]:
@@ -233,8 +342,20 @@ class Settings(BaseModel):
             },
             "access_control": {"mode": self.access_control.mode},
             "models": model_view,
+            "planning": self.planning.model_dump(),
+            "translation": self.translation.model_dump(),
             "retrieval": self.retrieval.model_dump(),
             "generation": self.generation.model_dump(),
+            "ragas": {
+                "enabled": self.ragas.enabled,
+                "backend": self.ragas.llm_backend,
+                "judge_model": self.ragas.judge_model,
+                "embedding_model": self.ragas.embedding_model,
+                "ollama_base_url": self.ragas.ollama_base_url,
+                "api_base_url": self.ragas.api_base_url,
+                "api_model": self.ragas.api_model,
+                "api_embedding_model": self.ragas.api_embedding_model,
+            },
             "logging": self.logging.model_dump(by_alias=True),
         }
 

@@ -70,8 +70,9 @@ models:
     base_url: ${ANSWER_MODEL_BASE_URL:-http://localhost:8000/v1}
     api_key: ${ANSWER_MODEL_API_KEY:-}
     model_name: ${ANSWER_MODEL_NAME:-Qwen3.5-9B}
-    timeout_seconds: 60
-    temperature: 0.1
+    timeout_seconds: ${ANSWER_MODEL_TIMEOUT_SECONDS:-180}
+    temperature: 0
+    seed: 42
     max_output_tokens: 2048
   verifier:
     enabled: ${VERIFIER_MODEL_ENABLED:-false}
@@ -81,7 +82,7 @@ models:
     model_name: ${VERIFIER_MODEL_NAME:-Qwen3-4B-Instruct-2507}
     timeout_seconds: 30
     temperature: 0
-    max_output_tokens: 512
+    max_output_tokens: 1536
   embedding:
     enabled: ${EMBEDDING_MODEL_ENABLED:-false}
     required: ${EMBEDDING_MODEL_REQUIRED:-false}
@@ -95,14 +96,47 @@ models:
     base_url: ${RERANKER_MODEL_BASE_URL:-http://localhost:8003/v1}
     api_key: ${RERANKER_MODEL_API_KEY:-}
     model_name: ${RERANKER_MODEL_NAME:-Qwen3-Reranker-0.6B}
-    timeout_seconds: 30
+    timeout_seconds: 60
     operation_path: ${RERANKER_PATH:-/rerank}
+
+planning:
+  enabled: true
+  # 本机 OLLAMA_MAX_LOADED_MODELS=1；4B planner 实测约 10-15 秒且复杂题
+  # 矩阵结构无效率 100%。保留完整能力，默认使用确定性/legacy adapter。
+  model_enabled: false
+  model_role: verifier
+  timeout_seconds: 15
+  max_subqueries: 8
+  min_confidence: 0.75
+  use_deterministic_fast_path: true
+  fallback_to_legacy: true
+  shadow_mode: true
+  diagnostics_enabled: true
+  prompt_path: prompts/query_planning.txt
+  prompt_version: query-planning-v1
+
+translation:
+  enabled: true
+  # 与 planner 同一资源约束；接入独立轻量或远程 verifier 后再启用。
+  model_enabled: false
+  trigger: low_confidence_only
+  timeout_seconds: 10
+  max_variants_per_cell: 1
+  max_total_translations: 4
+  min_original_results: 1
+  min_coverage_confidence: 0.55
+  preserve_original_query: true
+  prompt_path: prompts/query_translation.txt
+  prompt_version: query-translation-v1
 
 retrieval:
   candidate_top_k: 30
-  rerank_input_k: 30
+  rerank_input_k: 12
   rerank_top_k: 6
   max_final_chunks: 8
+  procedure_rerank_input_k: 22
+  procedure_rerank_top_k: 16
+  procedure_final_limit: 18
   similarity_threshold: 0.25
   vector_similarity_weight: 0.3
   allow_rerank_fallback: false
@@ -112,22 +146,65 @@ retrieval:
   enable_adjacent_context: true
   max_adjacent_chunks: 1
   max_complex_subqueries: 12
-  complex_candidates_per_subquery: 6
-  complex_rerank_input_k: 36
+  # 单主体 multi_hop（如"同时使用5G基站与自动机巢…空域通信/机巢运维/数据
+  # 归档三类要求"）的每个子查询是全库检索：8 个候选会被高相关文档占满，
+  # 某方面的低分章节（如河湖规程的"9 资料归档"）被挤出，导致该方面缺失。
+  # 扩大到 12（pydantic 上限）让 coverage 选择器有更多候选可挑；最终名额
+  # 仍由 complex_final_limit（12）约束，不显著增加下游负担。
+  complex_candidates_per_subquery: 12
+  complex_rerank_input_k: 20
+  complex_final_limit: 12
   complex_similarity_threshold: 0.15
+  min_rerank_score: 0.1
   complex_min_rerank_score: 0.1
+  enforce_declared_scope: true
+  max_parallel_ragflow_requests: 2
+  per_cell_candidate_top_k: 12
+  max_section_expansion_queries_per_cell: 2
+  fusion_rrf_k: 60
+  translated_query_weight: 0.85
 
 generation:
   require_citations: true
   reject_on_no_evidence: true
   allow_partial_answer: true
-  json_repair_attempts: 1
+  enforce_scope_consistency: true
+  enforce_claim_grounding: true
+  enforce_subject_grounding: true
+  enforce_claim_topic: true
+  enforce_comparison_completeness: true
+  json_repair_attempts: 2
   max_evidence_sentences: 16
-  max_sentences_per_citation: 3
+  max_sentences_per_citation: 5
   min_evidence_overlap: 0.08
   answer_prompt_path: prompts/answer_generation.txt
   repair_prompt_path: prompts/json_repair.txt
-  prompt_version: answer-generation-v1
+  prompt_version: answer-generation-v15
+  document_section_prompt_path: prompts/document_section_generation.txt
+  document_section_prompt_version: document-section-generation-v1
+  comparison_matrix_first: true
+  # 8GB 本机优先零模型调用返回确定性矩阵；远程答案模型可按需开启。
+  comparison_summary_enabled: false
+  comparison_summary_timeout_seconds: 30
+  comparison_summary_max_attempts: 1
+  matrix_summary_prompt_path: prompts/matrix_summary.txt
+
+evaluation:
+  enabled: true
+  database_path: D:/internal-rag/temp/rag-eval-reports/runs.db
+
+ragas:
+  enabled: true
+  judge_model: ${RAGAS_JUDGE_MODEL:-qwen3:4b-instruct-2507-q4_K_M}
+  embedding_model: ${RAGAS_EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+  ollama_base_url: ${RAGAS_OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+  # OpenAI 兼容 API（配置 api_model 后优先用 API 判题；留空则用本地 Ollama）
+  api_base_url: ${RAGAS_API_BASE_URL:-}
+  api_key: ${RAGAS_API_KEY:-}
+  api_model: ${RAGAS_API_MODEL:-}
+  api_embedding_model: ${RAGAS_API_EMBEDDING_MODEL:-}
+  benchmark_path: D:/internal-rag/source/rag-evaluation/datasets/benchmark.jsonl
+  max_cases: 20
 
 logging:
   level: ${LOG_LEVEL:-INFO}

@@ -3,4 +3,15 @@
 根据 validation_error 修复 invalid_output，使其完全符合给定 JSON Schema。
 只能使用 allowed_citation_ids，不得新增事实、引用或证据。
 保留原输出中已经有证据支持的内容；无法安全修复的事实必须删除。
+若 answerability 为 ANSWERABLE 或 PARTIALLY_ANSWERABLE，但 claims 缺失或为空：
+1. 将 answer 中已有且被 evidence 直接支持的事实拆分为一条或多条 claims。
+2. 每条 claim 必须包含非空 claim_id、claim 和 citation_ids。
+3. citation_ids 只能使用直接支持该事实的 allowed_citation_ids。
+4. 不得为了补 claims 新增原 answer 中没有的事实；无法绑定证据的事实必须删除。
+5. answer 中保留的每条事实必须使用与对应 claim 一致的 [Cx] 引用。
+若 validation_error 指出"数值不被引用支撑"或"引用内容与主张所指规范不一致"，请依据 evidence 中的原文（每条含 citation_id、text、document_name、version）修正：
+1. 找出支撑该数值的正确 citation（数值必须确实出现在对应 evidence 文本中）。
+2. 引用其他文件内容时，如实标明其真实出处。
+3. 找不到支撑证据的数值/事实必须删除，不得臆造。
+若 validation_error 指出"对比答案缺少格子"（对比矩阵某主体×维度格子缺失），必须**补充**该格内容，而不是删除其它格子：error 中给出的证据编号（如 [C4, C6, C7]）对应的 evidence 原文是该格的事实来源，据此撰写该格内容并引用这些编号；若证据中确无该方面内容，该格写"当前资料中未明确说明"。不得为规避错误而删减已有格子。
 只输出一个 JSON 对象，不要输出 Markdown、代码围栏或解释。
