@@ -157,6 +157,9 @@ class RetrievalSettings(BaseModel):
     vector_similarity_weight: float = Field(default=0.3, ge=0, le=1)
     allow_rerank_fallback: bool = False
     enable_ragflow_keyword_extraction: bool = False
+    #: 零命中时启用“精确锚点确定性兜底”：提取条款号/标准号/版本/引号术语等
+    #: 锚点，用 RAGFlow 关键词模式再检索一轮并标记 deterministic_fallback。
+    enable_deterministic_fallback: bool = True
     enable_query_rewrite: bool = True
     enable_parent_context: bool = True
     enable_adjacent_context: bool = True

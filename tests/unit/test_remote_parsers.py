@@ -14,6 +14,35 @@ from app.ingestion.parsers import DoclingClient, MinerUClient, ParserRegistry
 from app.ingestion.parsers.remote import clean_inline_latex, latex_to_text
 
 
+def test_mineru_preserves_margins_uncaptioned_images_and_formula_metadata() -> None:
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "doc/doc_content_list.json",
+            json.dumps(
+                [
+                    {
+                        "type": "aside_text",
+                        "text": "17965",
+                        "page_idx": 0,
+                        "bbox": [941, 891, 962, 940],
+                    },
+                    {"type": "image", "img_path": "images/note.png", "page_idx": 0},
+                    {"type": "text", "text": "Title 14", "text_level": 2, "page_idx": 0},
+                    {"type": "equation", "text": "F=ma", "page_idx": 0},
+                ]
+            ),
+        )
+        archive.writestr("doc/images/note.png", b"image")
+    result = MinerUClient._read_archive(buffer.getvalue())
+    assert "17965" not in result.page_texts[1]
+    assert result.excluded_blocks[1][0].text == "17965"
+    mapped = MinerUClient._map_batch_blocks(result, start_page=11, end_page=20)
+    assert mapped[11][0].image_content == b"image"
+    assert mapped[11][1].text_level == 2
+    assert mapped[11][2].latex == "F=ma"
+
+
 def _pdf(path: Path, *, pages: int = 1) -> None:
     writer = PdfWriter()
     for _ in range(pages):
@@ -319,9 +348,7 @@ def test_hybrid_parser_retries_missing_ocr_page_individually(tmp_path: Path) -> 
 
 
 def test_latex_to_text_converts_chemistry_formula_to_readable_text() -> None:
-    source = (
-        r"$( \mathrm { N a N O _ { 3 } } ) : 3 . 0 \ \mathrm { g } ;$"
-    )
+    source = r"$( \mathrm { N a N O _ { 3 } } ) : 3 . 0 \ \mathrm { g } ;$"
     assert latex_to_text(source) == "(NaNO3):3.0g;"
 
 

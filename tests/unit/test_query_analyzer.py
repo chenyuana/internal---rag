@@ -47,3 +47,23 @@ def test_tongchou_qufen_three_stage_question_is_comparison() -> None:
 def test_qubie_and_tongyi_are_comparison() -> None:
     assert QueryAnalyzer().analyze("A型无人机和B型无人机有什么区别？").query_type == "comparison"
     assert QueryAnalyzer().analyze("两种巡检方式的异同有哪些？").query_type == "comparison"
+
+
+def test_inventory_questions_are_detected_without_changing_query_type() -> None:
+    """枚举/计数型问题标记 requires_inventory，但 query_type 保持语义分类。"""
+    version = QueryAnalyzer().analyze("CCAR-25 有哪些版本？")
+    assert version.requires_inventory is True
+    assert version.inventory_reason is not None
+    assert version.query_type == "fact"
+
+    rounds = QueryAnalyzer().analyze("测试流程一共几轮？")
+    assert rounds.requires_inventory is True
+
+    files = QueryAnalyzer().analyze("全部文件清单有哪些？")
+    assert files.requires_inventory is True
+
+
+def test_semantic_questions_are_not_marked_as_inventory() -> None:
+    assert QueryAnalyzer().analyze("系统有哪些功能？").requires_inventory is False
+    assert QueryAnalyzer().analyze("这个功能怎么用？").requires_inventory is False
+    assert QueryAnalyzer().analyze("如何部署这个系统？").requires_inventory is False

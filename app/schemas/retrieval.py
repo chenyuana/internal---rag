@@ -94,6 +94,28 @@ class NormalizedQuery(BaseModel):
     exact_tokens: list[str] = Field(default_factory=list)
     article_ids: list[str] = Field(default_factory=list)
     article_aliases: list[str] = Field(default_factory=list)
+    #: 枚举/计数型问题（有哪些版本/几轮/几次/全部文件…）需要知识库文档清单
+    #: 作为答案边界，避免只信检索 Top-N 漏数。与 query_type 相互独立。
+    requires_inventory: bool = False
+    inventory_reason: str | None = None
+
+
+class RetrievalFailure(BaseModel):
+    """一次检索环节的失败记录。
+
+    区分“零命中”（知识可能未收录，可补检）与“请求失败”（HTTP/网络/权限等，
+    失败不等于未收录）。供前端展示哪一步、哪个数据集失败，并支持按错误类型
+    决定降级策略：权限失败必须明确失败，超时/暂不可用可重试或部分降级。
+    """
+
+    stage: str
+    error_code: str
+    message: str | None = None
+    dataset_ids: list[str] = Field(default_factory=list)
+    document_ids: list[str] = Field(default_factory=list)
+    retryable: bool = False
+    recovered: bool = False
+    latency_ms: float | None = None
 
 
 class MetadataCondition(BaseModel):
@@ -178,6 +200,9 @@ class RetrievedChunk(BaseModel):
     vector_score: float = 0
     keyword_score: float = 0
     rerank_score: float | None = None
+    #: 检索来源阶段（如 deterministic_fallback），供前端/证据处理区分普通
+    #: RAG 命中与确定性锚点兜底命中。
+    retrieval_stage: str | None = None
 
 
 class SelectedChunk(BaseModel):
@@ -193,6 +218,8 @@ class SelectedChunk(BaseModel):
     rerank_score: float | None = None
     # 对比/矩阵规划下，该 chunk 来自哪个子查询（从而归属哪个对比主体）。
     subquery_id: str | None = None
+    #: 检索来源阶段（如 deterministic_fallback）。
+    retrieval_stage: str | None = None
 
 
 class Citation(BaseModel):
@@ -225,6 +252,12 @@ class RetrievalSearchResponse(BaseModel):
     reranker_fallback: bool
     query_plan: QueryPlan | None = None
     coverage_matrix: list[CoverageCell] = Field(default_factory=list)
+    #: 检索环节失败记录（API 可见；失败不等于未收录）。
+    failures: list[RetrievalFailure] = Field(default_factory=list)
+    #: 是否经过精确锚点确定性兜底。
+    deterministic_fallback: bool = False
+    #: 枚举/计数型问题的文档清单边界（requires_inventory 时填充）。
+    doc_inventory: dict[str, Any] | None = None
 
 
 class RetrievalCandidateDebug(BaseModel):
@@ -245,6 +278,7 @@ class RetrievalCandidateDebug(BaseModel):
     citation_id: str | None = None
     filter_reason: str | None = None
     subquery_id: str | None = None
+    retrieval_stage: str | None = None
 
 
 class RetrievalDebugResponse(RetrievalSearchResponse):

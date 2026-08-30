@@ -131,6 +131,54 @@ class RagflowClient:
                 result.append({"id": dataset_id, "name": name})
         return result
 
+    async def list_documents(
+        self,
+        dataset_id: str,
+        page: int = 1,
+        page_size: int = 1024,
+    ) -> list[dict[str, str]]:
+        """Return one page of documents inside a dataset as ``[{"id", "name"}]``.
+
+        Used by enumeration/counting questions to build the answer boundary
+        (the full document inventory) instead of trusting retrieval Top-N.
+        Callers page through with ``page`` until fewer than ``page_size`` items
+        are returned.
+        """
+        try:
+            response = await self._client.get(
+                f"api/v1/datasets/{dataset_id}/documents",
+                params={"page": page, "page_size": page_size},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise AppError(
+                code="RAGFLOW_UNAVAILABLE",
+                message="RAGFlow is unavailable while listing documents.",
+                status_code=503,
+                details={"error_type": type(exc).__name__},
+            ) from exc
+        if not isinstance(payload, dict):
+            return []
+        data = payload.get("data")
+        if isinstance(data, dict):
+            items = data.get("docs", [])
+        elif isinstance(data, list):
+            items = data
+        else:
+            return []
+        if not isinstance(items, list):
+            return []
+        result: list[dict[str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            document_id = item.get("id")
+            name = item.get("name")
+            if isinstance(document_id, str) and document_id and isinstance(name, str) and name:
+                result.append({"id": document_id, "name": name})
+        return result
+
     @staticmethod
     def _normalize_chunk(item: dict[str, object]) -> RetrievedChunk | None:
         chunk_id = item.get("id") or item.get("chunk_id")

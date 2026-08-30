@@ -1419,3 +1419,192 @@ async def test_multi_hop_with_declared_subjects_scopes_retrieval_per_document(
     assert "tourism-intruder" not in {item.chunk_id for item in execution.selected_chunks}
     assert execution.stage_counts["subject_discovery_calls"] == 2
     assert {item.source for item in execution.subject_resolutions} == {"retrieval"}
+
+
+class AnchorAwareRagflow:
+    """首次（原问题，含"精确条号"标记）返回空以触发兜底；兜底请求（锚点组合）返回命中。"""
+
+    def __init__(self, fallback: list[RetrievedChunk]) -> None:
+        self.fallback = fallback
+        self.requests: list[RagflowRetrievalRequest] = []
+
+    async def retrieve(
+        self,
+        request: RagflowRetrievalRequest,
+    ) -> list[RetrievedChunk]:
+        self.requests.append(request)
+        if "精确条号" in request.question:
+            return []
+        return self.fallback
+
+
+class FailingFallbackRagflow:
+    """首次零命中；兜底请求抛 RAGFLOW_UNAVAILABLE，用于验证兜底失败被记录。"""
+
+    def __init__(self) -> None:
+        self.requests: list[RagflowRetrievalRequest] = []
+
+    async def retrieve(
+        self,
+        request: RagflowRetrievalRequest,
+    ) -> list[RetrievedChunk]:
+        self.requests.append(request)
+        if "精确条号" in request.question:
+            return []
+        from app.core.exceptions import AppError
+
+        raise AppError(
+            code="RAGFLOW_UNAVAILABLE",
+            message="ragflow unavailable",
+            status_code=503,
+        )
+
+
+class InventoryAwareRagflow:
+    """支持检索 + 文档清单（分页：第一页返回全部，第二页为空）。"""
+
+    def __init__(
+        self,
+        chunks: list[RetrievedChunk],
+        documents: list[str] | None = None,
+    ) -> None:
+        self.chunks = chunks
+        self.documents = documents or ["CCAR-25-R4.pdf", "AC-25.981.pdf", "CCAR-23-R3.pdf"]
+        self.list_calls: list[tuple[str, int]] = []
+
+    async def retrieve(
+        self,
+        request: RagflowRetrievalRequest,
+    ) -> list[RetrievedChunk]:
+        return self.chunks
+
+    async def list_documents(
+        self,
+        dataset_id: str,
+        page: int = 1,
+        page_size: int = 1024,
+    ) -> list[dict[str, str]]:
+        self.list_calls.append((dataset_id, page))
+        if page == 1:
+            return [
+                {"id": f"doc-{index}", "name": name}
+                for index, name in enumerate(self.documents)
+            ]
+        return []
+
+
+async def test_anchor_fallback_recovers_zero_hit_retrieval(settings: Settings) -> None:
+    fake_ragflow = AnchorAwareRagflow(
+        [chunk("anchor-1", text="第25.981条 燃油系统防火要求。", score=0.85)]
+    )
+    retrieval_settings = settings.retrieval.model_copy(
+        update={"allow_rerank_fallback": True}
+    )
+    configured = settings.model_copy(update={"retrieval": retrieval_settings})
+    service = RetrievalService(
+        settings=configured,
+        ragflow=cast(RagflowClient, cast(Any, fake_ragflow)),
+        reranker=None,
+        access_control=AccessControlService(configured.access_control),
+    )
+
+    execution = await service.execute(
+        RetrievalSearchRequest(
+            query="CCAR-25 第25.981条 燃油系统防火要求？",
+            knowledge_base_ids=["kb-1"],
+        ),
+        user_id="user-1",
+    )
+    response = execution.search_response()
+
+    assert execution.deterministic_fallback is True
+    assert execution.stage_counts.get("deterministic_fallback") == 1
+    assert len(fake_ragflow.requests) == 2
+    assert fake_ragflow.requests[1].keyword is True
+    assert [item.chunk_id for item in execution.selected_chunks] == ["anchor-1"]
+    # API 响应与证据级来源标记
+    assert response.deterministic_fallback is True
+    assert response.chunks[0].retrieval_stage == "deterministic_fallback"
+    assert execution.candidates[0].retrieval_stage == "deterministic_fallback"
+
+
+async def test_anchor_fallback_not_triggered_when_first_round_has_hits(
+    settings: Settings,
+) -> None:
+    fake_ragflow = FakeRagflow([chunk("c1", text="有效证据一", score=0.90)])
+    service = RetrievalService(
+        settings=settings,
+        ragflow=cast(RagflowClient, cast(Any, fake_ragflow)),
+        reranker=None,
+        access_control=AccessControlService(settings.access_control),
+    )
+
+    execution = await service.execute(
+        RetrievalSearchRequest(
+            query="CCAR-25 第25.981条 燃油系统防火要求？",
+            knowledge_base_ids=["kb-1"],
+        ),
+        user_id="user-1",
+    )
+
+    assert execution.deterministic_fallback is False
+    assert execution.stage_counts.get("deterministic_fallback") is None
+    assert [item.chunk_id for item in execution.selected_chunks] == ["c1"]
+
+
+async def test_anchor_fallback_failure_is_recorded_as_failure(settings: Settings) -> None:
+    fake_ragflow = FailingFallbackRagflow()
+    retrieval_settings = settings.retrieval.model_copy(
+        update={"allow_rerank_fallback": True}
+    )
+    configured = settings.model_copy(update={"retrieval": retrieval_settings})
+    service = RetrievalService(
+        settings=configured,
+        ragflow=cast(RagflowClient, cast(Any, fake_ragflow)),
+        reranker=None,
+        access_control=AccessControlService(configured.access_control),
+    )
+
+    execution = await service.execute(
+        RetrievalSearchRequest(
+            query="CCAR-25 第25.981条 燃油系统防火要求？",
+            knowledge_base_ids=["kb-1"],
+        ),
+        user_id="user-1",
+    )
+    response = execution.search_response()
+
+    assert execution.deterministic_fallback is False
+    assert [failure.stage for failure in response.failures] == ["deterministic_fallback"]
+    assert response.failures[0].error_code == "RAGFLOW_UNAVAILABLE"
+    assert response.failures[0].retryable is True
+    assert response.failures[0].dataset_ids == ["kb-1"]
+
+
+async def test_inventory_question_builds_document_boundary(settings: Settings) -> None:
+    fake_ragflow = InventoryAwareRagflow([chunk("c1", text="有效证据一", score=0.90)])
+    service = RetrievalService(
+        settings=settings,
+        ragflow=cast(RagflowClient, cast(Any, fake_ragflow)),
+        reranker=None,
+        access_control=AccessControlService(settings.access_control),
+    )
+
+    execution = await service.execute(
+        RetrievalSearchRequest(
+            query="CCAR-25 有哪些版本？",
+            knowledge_base_ids=["kb-1"],
+        ),
+        user_id="user-1",
+    )
+    response = execution.search_response()
+
+    assert execution.query.requires_inventory is True
+    assert execution.doc_inventory is not None
+    assert execution.doc_inventory["total"] == 3
+    assert execution.doc_inventory["by_dataset"] == {
+        "kb-1": ["CCAR-25-R4.pdf", "AC-25.981.pdf", "CCAR-23-R3.pdf"]
+    }
+    assert fake_ragflow.list_calls == [("kb-1", 1)]
+    assert response.doc_inventory == execution.doc_inventory
+    assert response.chunks[0].retrieval_stage is None

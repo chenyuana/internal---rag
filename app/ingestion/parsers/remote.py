@@ -6,7 +6,7 @@ import mimetypes
 import re
 import zipfile
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -314,17 +314,13 @@ def latex_to_text(latex: str) -> str:
     # instead of dropping the operator and leaving a bare subscript. Runs
     # before generic subscript handling so the bound is not consumed first.
     text = _NAMED_OPERATOR_RE.sub(
-        lambda match: match.group("op") + (
-            "(" + match.group("arg") + ")"
-            if match.group("arg")
-            else ""
+        lambda match: (
+            match.group("op") + ("(" + match.group("arg") + ")" if match.group("arg") else "")
         ),
         text,
     )
     # Preserve the symbol mapping (∑, ∏, √…) before generic command removal.
-    text = _GREEK_OR_SYMBOL_RE.sub(
-        lambda match: _LATEX_SYMBOLS[match.group(0)], text
-    )
+    text = _GREEK_OR_SYMBOL_RE.sub(lambda match: _LATEX_SYMBOLS[match.group(0)], text)
     text = re.sub(r"_\s*\{([^{}]*)\}", lambda m: _subscript(m.group(1)), text)
     text = re.sub(r"\^\s*\{([^{}]*)\}", lambda m: "^" + re.sub(r"\s+", "", m.group(1)), text)
     # `\sqrt` may be written with a space before the brace: `\sqrt { ... }`.
@@ -384,6 +380,8 @@ class RemoteContentBlock:
     # readable form drives retrieval while the LaTeX is preserved for
     # faithful rendering / review as chunk metadata.
     latex: str | None = None
+    source_type: str = ""
+    text_level: int | None = None
 
 
 @dataclass(slots=True)
@@ -393,6 +391,7 @@ class RemoteParseResult:
     page_blocks: dict[int, list[RemoteContentBlock]] = field(default_factory=dict)
     document_text: str = ""
     warnings: list[str] = field(default_factory=list)
+    excluded_blocks: dict[int, list[RemoteContentBlock]] = field(default_factory=dict)
 
 
 class RemoteParserClient:
@@ -445,6 +444,7 @@ class MinerUClient(RemoteParserClient):
         return {
             "table": "table",
             "image": "figure",
+            "chart": "figure",
             "equation": "formula",
             "interline_equation": "formula",
             "inline_equation": "formula",
@@ -455,7 +455,7 @@ class MinerUClient(RemoteParserClient):
     @staticmethod
     def _item_text(item: dict[str, Any]) -> str:
         item_type = str(item.get("type", "")).casefold()
-        if item_type in {"header", "footer", "page_number", "discarded"}:
+        if item_type in {"header", "footer", "page_number", "discarded", "aside_text"}:
             return ""
         if item_type == "table":
             parts = [
@@ -538,7 +538,9 @@ class MinerUClient(RemoteParserClient):
     def _read_archive(cls, content: bytes) -> RemoteParseResult:
         page_parts: dict[int, list[str]] = {}
         page_blocks: dict[int, list[RemoteContentBlock]] = {}
+        excluded_blocks: dict[int, list[RemoteContentBlock]] = {}
         markdown = ""
+        warnings: list[str] = []
         with zipfile.ZipFile(BytesIO(content)) as archive:
             members = archive.infolist()
             if len(members) > MAX_REMOTE_ARCHIVE_MEMBERS:
@@ -563,26 +565,39 @@ class MinerUClient(RemoteParserClient):
                     if not isinstance(page_idx, int) or page_idx < 0:
                         continue
                     text = cls._item_text(raw_item)
-                    if text:
-                        page_number = page_idx + 1
-                        page_parts.setdefault(page_number, []).append(text)
-                        item_type = str(raw_item.get("type", "")).casefold()
-                        image_filename, image_content, image_mime_type = (
-                            cls._archive_asset(
-                                archive,
-                                json_name=name,
-                                item=raw_item,
+                    item_type = str(raw_item.get("type", "")).casefold()
+                    if item_type in {"header", "footer", "page_number", "discarded", "aside_text"}:
+                        excluded_blocks.setdefault(page_idx + 1, []).append(
+                            RemoteContentBlock(
+                                page_number=page_idx + 1,
+                                block_type="annotation",
+                                text=str(raw_item.get("text", "") or ""),
+                                bbox=cls._bbox(raw_item),
+                                source_type=item_type,
                             )
                         )
+                        continue
+                    if text or raw_item.get("img_path") or raw_item.get("image_path"):
+                        page_number = page_idx + 1
+                        if text:
+                            page_parts.setdefault(page_number, []).append(text)
+                        item_type = str(raw_item.get("type", "")).casefold()
+                        image_filename, image_content, image_mime_type = cls._archive_asset(
+                            archive,
+                            json_name=name,
+                            item=raw_item,
+                        )
+                        if (
+                            raw_item.get("img_path") or raw_item.get("image_path")
+                        ) and not image_content:
+                            warnings.append(f"Missing image asset on page {page_number}.")
                         page_blocks.setdefault(page_number, []).append(
                             RemoteContentBlock(
                                 page_number=page_number,
                                 block_type=cls._block_type(raw_item),
                                 text=text,
                                 table_html=(
-                                    clean_inline_latex(
-                                        str(raw_item.get("table_body", "")).strip()
-                                    )
+                                    clean_inline_latex(str(raw_item.get("table_body", "")).strip())
                                     if item_type == "table"
                                     and "<table" in str(raw_item.get("table_body", "")).casefold()
                                     else None
@@ -592,6 +607,12 @@ class MinerUClient(RemoteParserClient):
                                 image_filename=image_filename,
                                 image_content=image_content,
                                 image_mime_type=image_mime_type,
+                                source_type=item_type,
+                                text_level=(
+                                    raw_item.get("text_level")
+                                    if isinstance(raw_item.get("text_level"), int)
+                                    else None
+                                ),
                                 latex=(
                                     _latex_if_real(raw_item)
                                     if item_type
@@ -600,7 +621,7 @@ class MinerUClient(RemoteParserClient):
                                 ),
                             )
                         )
-                if page_parts:
+                if page_blocks or excluded_blocks:
                     break
 
             markdown_names = [
@@ -612,12 +633,12 @@ class MinerUClient(RemoteParserClient):
         return RemoteParseResult(
             parser_name=cls.name,
             page_texts={
-                page_number: "\n\n".join(parts)
-                for page_number, parts in sorted(page_parts.items())
+                page_number: "\n\n".join(parts) for page_number, parts in sorted(page_parts.items())
             },
             page_blocks=page_blocks,
+            excluded_blocks=excluded_blocks,
             document_text=markdown.strip(),
-            warnings=[] if page_parts else ["MinerU result has no page-indexed content list."],
+            warnings=warnings + ([] if page_parts else ["MinerU result has no page-indexed text."]),
         )
 
     def _parse_request(
@@ -647,9 +668,7 @@ class MinerUClient(RemoteParserClient):
             "end_page_id": str(end_page_id),
         }
         page_label = (
-            f"{start_page}-{end_page}"
-            if start_page is not None and end_page is not None
-            else "all"
+            f"{start_page}-{end_page}" if start_page is not None and end_page is not None else "all"
         )
         try:
             with path.open("rb") as source, self._client() as client:
@@ -662,8 +681,7 @@ class MinerUClient(RemoteParserClient):
                 response.raise_for_status()
         except httpx.HTTPError as exc:
             raise RuntimeError(
-                f"MinerU request failed for pages {page_label}: "
-                f"{type(exc).__name__}: {exc}"
+                f"MinerU request failed for pages {page_label}: {type(exc).__name__}: {exc}"
             ) from exc
         content_type = response.headers.get("content-type", "")
         if "zip" not in content_type.casefold() and not response.content.startswith(b"PK"):
@@ -689,11 +707,7 @@ class MinerUClient(RemoteParserClient):
         for page_number in sorted(set(page_numbers)):
             if page_number < 1:
                 continue
-            if (
-                not batches
-                or len(batches[-1]) >= batch_size
-                or page_number != batches[-1][-1] + 1
-            ):
+            if not batches or len(batches[-1]) >= batch_size or page_number != batches[-1][-1] + 1:
                 batches.append([page_number])
             else:
                 batches[-1].append(page_number)
@@ -734,20 +748,7 @@ class MinerUClient(RemoteParserClient):
             resolved_page = page_number + start_page - 1 if relative else page_number
             if resolved_page not in expected:
                 continue
-            mapped[resolved_page] = [
-                RemoteContentBlock(
-                    page_number=resolved_page,
-                    block_type=block.block_type,
-                    text=block.text,
-                    table_html=block.table_html,
-                    caption=block.caption,
-                    bbox=block.bbox,
-                    image_filename=block.image_filename,
-                    image_content=block.image_content,
-                    image_mime_type=block.image_mime_type,
-                )
-                for block in blocks
-            ]
+            mapped[resolved_page] = [replace(block, page_number=resolved_page) for block in blocks]
         return mapped
 
     def parse_pages(
@@ -763,6 +764,7 @@ class MinerUClient(RemoteParserClient):
             batch_size = self.settings.page_batch_size
         page_texts: dict[int, str] = {}
         page_blocks: dict[int, list[RemoteContentBlock]] = {}
+        excluded_blocks: dict[int, list[RemoteContentBlock]] = {}
         document_parts: list[str] = []
         warnings: list[str] = []
         target = sorted(set(page_numbers))
@@ -795,9 +797,15 @@ class MinerUClient(RemoteParserClient):
             )
             if result.document_text:
                 document_parts.append(result.document_text)
+            excluded_blocks.update(
+                self._map_batch_blocks(
+                    replace(result, page_blocks=result.excluded_blocks),
+                    start_page=start_page,
+                    end_page=end_page,
+                )
+            )
             warnings.extend(
-                f"pages {start_page}-{end_page}: {warning}"
-                for warning in result.warnings
+                f"pages {start_page}-{end_page}: {warning}" for warning in result.warnings
             )
         return RemoteParseResult(
             parser_name=self.name,
@@ -805,6 +813,7 @@ class MinerUClient(RemoteParserClient):
             page_blocks=page_blocks,
             document_text="\n\n".join(document_parts),
             warnings=warnings,
+            excluded_blocks=excluded_blocks,
         )
 
     def parse(self, path: Path) -> RemoteParseResult:
@@ -904,9 +913,7 @@ class DoclingClient(RemoteParserClient):
                 "v1/convert/source",
                 {
                     "options": chunked_options,
-                    "sources": [
-                        {"kind": "file", "filename": path.name, "base64_string": encoded}
-                    ],
+                    "sources": [{"kind": "file", "filename": path.name, "base64_string": encoded}],
                 },
             ),
             (
@@ -920,9 +927,7 @@ class DoclingClient(RemoteParserClient):
                 "v1/convert/source",
                 {
                     "options": standard_options,
-                    "sources": [
-                        {"kind": "file", "filename": path.name, "base64_string": encoded}
-                    ],
+                    "sources": [{"kind": "file", "filename": path.name, "base64_string": encoded}],
                 },
             ),
             (

@@ -3582,7 +3582,10 @@ def write_document(
     parser_name = str(document.qa.get("parser_name", "native-pdf"))
     parser_metadata = {
         "name": parser_name,
-        "version": pypdf_version if parser_name == "native-pdf" else "1",
+        "version": (
+            pypdf_version if parser_name == "native-pdf"
+            else document.qa.get("parser_version", "1")
+        ),
         "trace": document.qa.get("parser_trace", []),
     }
     blocks_by_page: dict[int, list[BlockRecord]] = defaultdict(list)

@@ -151,3 +151,38 @@ async def test_ragflow_list_datasets_parses_docs_wrapper() -> None:
         await client.close()
 
     assert datasets == [{"id": "kb-1", "name": "法规"}, {"id": "kb-2", "name": "test"}]
+
+
+async def test_ragflow_list_documents_parses_docs_wrapper() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/datasets/kb-1/documents"
+        assert request.url.params["page"] == "2"
+        assert request.url.params["page_size"] == "1024"
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "docs": [
+                        {"id": "doc-1", "name": "CCAR-25-R4.pdf"},
+                        {"id": "doc-2", "name": "AC-25.981.pdf"},
+                    ]
+                },
+            },
+        )
+
+    settings = RagflowSettings(
+        enabled=True,
+        required=True,
+        base_url="http://ragflow.local",
+    )
+    client = RagflowClient(settings, transport=httpx.MockTransport(handler))
+    try:
+        documents = await client.list_documents("kb-1", page=2)
+    finally:
+        await client.close()
+
+    assert documents == [
+        {"id": "doc-1", "name": "CCAR-25-R4.pdf"},
+        {"id": "doc-2", "name": "AC-25.981.pdf"},
+    ]

@@ -23,6 +23,7 @@ from app.schemas.retrieval import (
     RagflowRetrievalRequest,
     RetrievalCandidateDebug,
     RetrievalDebugResponse,
+    RetrievalFailure,
     RetrievalSearchRequest,
     RetrievalSearchResponse,
     RetrievedChunk,
@@ -82,6 +83,12 @@ class RetrievalExecution:
     model_call_counts: dict[str, int] = field(default_factory=dict)
     stage_latencies_ms: dict[str, float] = field(default_factory=dict)
     evidence_records: list[EvidenceRecord] = field(default_factory=list)
+    #: 检索环节失败记录（结构化区分“零命中”与“请求失败”；失败不等于未收录）。
+    failures: list[RetrievalFailure] = field(default_factory=list)
+    #: 是否经过“精确锚点确定性兜底”（零命中后关键词模式再检索一轮）。
+    deterministic_fallback: bool = False
+    #: 枚举/计数型问题的文档清单边界（requires_inventory 时填充）。
+    doc_inventory: dict[str, Any] | None = None
 
     def search_response(self) -> RetrievalSearchResponse:
         return RetrievalSearchResponse(
@@ -95,6 +102,9 @@ class RetrievalExecution:
             reranker_fallback=self.reranker_fallback,
             query_plan=self.query_plan,
             coverage_matrix=self.coverage_matrix,
+            failures=self.failures,
+            deterministic_fallback=self.deterministic_fallback,
+            doc_inventory=self.doc_inventory,
         )
 
     def debug_response(self) -> RetrievalDebugResponse:
@@ -192,11 +202,80 @@ class RetrievalService:
         execution.model_call_counts["planner"] = planning.model_calls
         execution.stage_latencies_ms["planner"] = planning.latency_ms
         execution.stage_counts["planner_fallback"] = int(planning.fallback)
+        if query.requires_inventory:
+            # 枚举/计数型问题：列出授权数据集内的完整文档清单作为答案边界
+            # （文档名/版本/轮次类答案不能只信检索 Top-N）。
+            execution.doc_inventory = await self._build_doc_inventory(
+                request,
+                user_id=user_id,
+                failures=execution.failures,
+            )
         execution.stage_latencies_ms["retrieval_total"] = round(
             (time.perf_counter() - started) * 1000,
             2,
         )
         return execution
+
+    async def _build_doc_inventory(
+        self,
+        request: RetrievalSearchRequest,
+        *,
+        user_id: str,
+        failures: list[RetrievalFailure],
+    ) -> dict[str, Any] | None:
+        """聚合授权数据集内的文档清单（分页拉取，避免超过单页上限漏数）。"""
+        if self._ragflow is None:
+            return None
+        try:
+            allowed_datasets = await self._access_control.authorize_knowledge_bases(
+                user_id=user_id,
+                requested_ids=request.knowledge_base_ids,
+            )
+        except AppError as exc:
+            failures.append(
+                RetrievalFailure(
+                    stage="inventory",
+                    error_code=exc.code,
+                    message=exc.message,
+                    dataset_ids=list(request.knowledge_base_ids),
+                    retryable=False,
+                    recovered=False,
+                )
+            )
+            return None
+        by_dataset: dict[str, list[str]] = {}
+        total = 0
+        for dataset_id in allowed_datasets:
+            names: list[str] = []
+            started = time.perf_counter()
+            try:
+                page = 1
+                while True:
+                    page_docs = await self._ragflow.list_documents(
+                        dataset_id,
+                        page=page,
+                        page_size=1024,
+                    )
+                    names.extend(item["name"] for item in page_docs)
+                    if len(page_docs) < 1024 or page >= 10:
+                        break
+                    page += 1
+            except AppError as exc:
+                failures.append(
+                    RetrievalFailure(
+                        stage="inventory",
+                        error_code=exc.code,
+                        message=exc.message,
+                        dataset_ids=[dataset_id],
+                        retryable=exc.code == "RAGFLOW_UNAVAILABLE",
+                        recovered=False,
+                        latency_ms=round((time.perf_counter() - started) * 1000, 2),
+                    )
+                )
+                continue
+            by_dataset[dataset_id] = names
+            total += len(names)
+        return {"total": total, "by_dataset": by_dataset}
 
     async def _execute_plan(
         self,
@@ -230,18 +309,36 @@ class RetrievalService:
             )
         executions: list[tuple[str, RetrievalExecution]] = []
         missing_subjects: set[str] = set()
+        failures: list[RetrievalFailure] = []
         subqueries = plan.subqueries[: self._settings.retrieval.max_complex_subqueries]
         cell_by_id = {cell.id: cell for cell in plan_v2.cells}
         for subquery in subqueries:
-            execution = await self._execute_single(
-                request.model_copy(update={"query": subquery.query}),
-                user_id=user_id,
-                apply_reranker=False,
-                final_limit=self._settings.retrieval.complex_candidates_per_subquery,
-                similarity_threshold=(
-                    self._settings.retrieval.complex_similarity_threshold
-                ),
-            )
+            started = time.perf_counter()
+            try:
+                execution = await self._execute_single(
+                    request.model_copy(update={"query": subquery.query}),
+                    user_id=user_id,
+                    apply_reranker=False,
+                    final_limit=self._settings.retrieval.complex_candidates_per_subquery,
+                    similarity_threshold=(
+                        self._settings.retrieval.complex_similarity_threshold
+                    ),
+                )
+            except AppError as exc:
+                # 部分子查询失败不整题失败：记录结构化 failures 后跳过该子查询，
+                # 其余子查询继续；最终由调用方决定是部分回答还是服务错误。
+                failures.append(
+                    RetrievalFailure(
+                        stage="subquery",
+                        error_code=exc.code,
+                        message=exc.message,
+                        dataset_ids=list(request.knowledge_base_ids),
+                        retryable=exc.code == "RAGFLOW_UNAVAILABLE",
+                        recovered=False,
+                        latency_ms=round((time.perf_counter() - started) * 1000, 2),
+                    )
+                )
+                continue
             # 单主体 multi_hop（如"同时使用5G基站与自动机巢…空域通信/机巢
             # 运维/数据归档三类要求"）的每个子查询也是全库检索：aspect 词被
             # 完整长主语稀释后，该方面的独立语义检索视角可能漏掉字面相关但
@@ -285,6 +382,14 @@ class RetrievalService:
                         execution.candidate_count += semantic_execution.candidate_count
                         execution.candidates.extend(semantic_execution.candidates)
             executions.append((subquery.id, execution))
+
+        if not executions:
+            raise AppError(
+                code="RAGFLOW_ALL_SUBQUERIES_FAILED",
+                message="所有检索子查询均失败，无法完成检索。",
+                status_code=503,
+                details={"failures": [failure.model_dump() for failure in failures]},
+            )
 
         results = self._complex_results(executions)
         complex_reranker_used = await self._rerank_complex_candidates(
@@ -349,10 +454,15 @@ class RetrievalService:
                 "covered_cells": sum(
                     cell.status == "covered" for cell in selection.matrix
                 ),
+                **({"subquery_failures": len(failures)} if failures else {}),
             },
             candidates=candidates,
             query_plan=plan,
             coverage_matrix=selection.matrix,
+            failures=failures,
+            deterministic_fallback=any(
+                item.deterministic_fallback for _, item in executions
+            ),
         )
 
     async def _execute_comparison_plan(
@@ -767,6 +877,45 @@ class RetrievalService:
             metadata_condition=metadata_condition,
         )
         raw_chunks = await self._ragflow.retrieve(ragflow_request)
+        failures: list[RetrievalFailure] = []
+        deterministic_fallback = False
+        if (
+            not raw_chunks
+            and self._settings.retrieval.enable_deterministic_fallback
+        ):
+            # 零命中 ≠ 未收录：用精确锚点（条款号/标准号/版本/引号术语/查询专有词）
+            # 走 RAGFlow 关键词模式再检索一轮。结果与首次合并后统一过过滤、
+            # rerank 与证据门禁；来源标记 deterministic_fallback，不伪装成向量命中。
+            fallback_request = self._anchor_fallback_request(ragflow_request, query)
+            if fallback_request is not None:
+                fallback_started = time.perf_counter()
+                try:
+                    fallback_chunks = await self._ragflow.retrieve(fallback_request)
+                except AppError as exc:
+                    fallback_chunks = []
+                    failures.append(
+                        RetrievalFailure(
+                            stage="deterministic_fallback",
+                            error_code=exc.code,
+                            message=exc.message,
+                            dataset_ids=list(request.knowledge_base_ids),
+                            document_ids=list(request.document_ids),
+                            retryable=exc.code == "RAGFLOW_UNAVAILABLE",
+                            recovered=False,
+                            latency_ms=round(
+                                (time.perf_counter() - fallback_started) * 1000,
+                                2,
+                            ),
+                        )
+                    )
+                if fallback_chunks:
+                    raw_chunks = [
+                        chunk.model_copy(
+                            update={"retrieval_stage": "deterministic_fallback"}
+                        )
+                        for chunk in fallback_chunks
+                    ]
+                    deterministic_fallback = True
         debug_items: list[RetrievalCandidateDebug] = []
         accepted: list[RetrievedChunk] = []
         seen: set[tuple[str, str]] = set()
@@ -953,8 +1102,62 @@ class RetrievalService:
                 "rerank_input": len(rerank_input),
                 "article_exact_matches": len(exact_matches),
                 "final_selected": len(selected),
+                **({"deterministic_fallback": 1} if deterministic_fallback else {}),
             },
             candidates=debug_items,
+            failures=failures,
+            deterministic_fallback=deterministic_fallback,
+        )
+
+    @staticmethod
+    def _anchor_terms(
+        query: NormalizedQuery,
+        ragflow_request: RagflowRetrievalRequest,
+    ) -> list[str]:
+        """提取确定性精确锚点：条款号/标准号、版本号、引号术语、查询专有词。
+
+        用于零命中兜底的关键词模式检索；只保留 2 字符以上且去重保序的锚点。
+        """
+        anchors: list[str] = []
+        anchors.extend(query.article_aliases)
+        anchors.extend(query.article_ids)
+        anchors.extend(
+            re.findall(
+                r"[\u201c\"]([^\u201d\"]{2,40})[\u201d\"]",
+                ragflow_request.question,
+            )
+        )
+        anchors.extend(
+            re.findall(
+                r"\b[A-Z]{2,6}-\d+(?:[A-Z]-\d+)?(?:[-.]\d+)*\b",
+                ragflow_request.question,
+            )
+        )
+        anchors.extend(
+            re.findall(r"\bv\d+(?:\.\d+){1,3}\b", ragflow_request.question, re.IGNORECASE)
+        )
+        return list(dict.fromkeys(anchor for anchor in anchors if len(anchor) >= 2))[:12]
+
+    @classmethod
+    def _anchor_fallback_request(
+        cls,
+        ragflow_request: RagflowRetrievalRequest,
+        query: NormalizedQuery,
+    ) -> RagflowRetrievalRequest | None:
+        """构造关键词模式兜底请求；锚点与原始查询无差异时返回 None（避免无意义重试）。"""
+        anchors = cls._anchor_terms(query, ragflow_request)
+        if not anchors:
+            return None
+        anchor_query = " ".join(anchors)
+        if " ".join(ragflow_request.question.split()) == anchor_query:
+            return None
+        return ragflow_request.model_copy(
+            update={
+                "question": anchor_query,
+                "keyword": True,
+                "similarity_threshold": min(ragflow_request.similarity_threshold, 0.2),
+                "page_size": min(ragflow_request.page_size, 20),
+            }
         )
 
     @staticmethod
@@ -1622,4 +1825,5 @@ class RetrievalService:
             keyword_score=chunk.keyword_score,
             raw_rank=raw_rank,
             filter_reason=reason,
+            retrieval_stage=chunk.retrieval_stage,
         )

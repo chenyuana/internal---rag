@@ -141,6 +141,8 @@ retrieval:
   vector_similarity_weight: 0.3
   allow_rerank_fallback: false
   enable_ragflow_keyword_extraction: false
+  # 零命中时启用“精确锚点确定性兜底”（关键词模式再检索一轮，标记 deterministic_fallback）
+  enable_deterministic_fallback: true
   enable_query_rewrite: true
   enable_parent_context: true
   enable_adjacent_context: true

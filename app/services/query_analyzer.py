@@ -27,6 +27,22 @@ _MULTI_DIMENSION_MARKERS = (
 # 不仅"结合"一种说法；"按照 A 和 B""综合 A 与 B 的要求"是同一语义。
 _CROSS_DOC_PATTERN = re.compile(r"(?:结合|综合|按照|依据|遵照)[^，,。！？!?]{0,30}[与和]")
 
+# 枚举/计数型问题检测（保守）：只有“答案本身就是文档/版本/轮次清单”时才
+# 需要知识库文档清单作为边界，避免把“有哪些功能”这类语义问题误判为枚举。
+# 与 query_type 独立：这类问题仍按其语义归类（fact/procedure 等）。
+_INVENTORY_VERSION = re.compile(
+    r"(哪些|几个|多少|全部|所有|完整|列表|清单).{0,8}(版本|版次|版|代次|型号|构型|系列)"
+)
+_INVENTORY_COUNT = re.compile(r"(几次|几轮|多少轮|多少次|共几|共多少|各次|各轮)")
+_INVENTORY_FILES = re.compile(
+    r"(哪些|全部|所有|列出|枚举).{0,6}(文件|文档|资料|附件|目录|清单)"
+)
+_INVENTORY_REASONS = (
+    "用户要求统计全部版本/型号清单",
+    "用户要求统计轮次/次数",
+    "用户要求枚举文件/文档清单",
+)
+
 class QueryAnalyzer:
     """Perform deterministic normalization without damaging technical symbols."""
 
@@ -47,6 +63,7 @@ class QueryAnalyzer:
         exact_tokens = list(
             dict.fromkeys([*EXACT_TOKEN_PATTERN.findall(normalized), *article_ids])
         )
+        requires_inventory, inventory_reason = self._inventory_detection(normalized)
         return NormalizedQuery(
             original_query=query,
             normalized_query=normalized,
@@ -54,7 +71,22 @@ class QueryAnalyzer:
             exact_tokens=exact_tokens,
             article_ids=article_ids,
             article_aliases=article_aliases,
+            requires_inventory=requires_inventory,
+            inventory_reason=inventory_reason,
         )
+
+    @staticmethod
+    def _inventory_detection(query: str) -> tuple[bool, str | None]:
+        """检测枚举/计数型问题是否需要文档清单作为答案边界（保守规则）。"""
+        patterns = (
+            (_INVENTORY_VERSION, 0),
+            (_INVENTORY_COUNT, 1),
+            (_INVENTORY_FILES, 2),
+        )
+        for pattern, index in patterns:
+            if pattern.search(query):
+                return True, _INVENTORY_REASONS[index]
+        return False, None
 
     @staticmethod
     def _classify(query: str) -> QueryType:
