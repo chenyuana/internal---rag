@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
+from app.services.domain_terms import normalize_concepts
+
 SENTENCE_BOUNDARY = re.compile(r"(?<=[。！？!?；;])\s*|\r?\n+")
 ASCII_TOKEN = re.compile(r"0[xX][0-9A-Fa-f]+|[A-Za-z_][A-Za-z0-9_.:-]*|\d+(?:\.\d+)?")
 HAN_RUN = re.compile(r"[\u4e00-\u9fff]+")
@@ -32,6 +34,8 @@ GENERIC_UNITS = {
 # （m、s、h）之前，避免交替匹配截断。
 _PARAM_UNIT_PATTERN = (
     r"667m[²2]|km/h|m/s|m[²2]|kHz|MHz|Hz|"
+    r"feet|foot|ft|knots?|lbs?|pounds?|degrees?|minutes?|seconds?|inches|"
+    r"percent|million|billion|英尺|英寸|海里|节|磅|美元|分钟|"
     r"km|cm|mm|kg|mL|ml|min|ms|"
     r"L|m|g|t|s|h|%|℃|°|"
     r"亩|米|千米|厘米|毫米|升|毫升|公斤|克|吨|秒|分|小时"
@@ -62,6 +66,7 @@ def split_sentences(text: str) -> list[str]:
 
 
 def lexical_units(text: str) -> set[str]:
+    text = normalize_concepts(text)
     units = {item.lower() for item in ASCII_TOKEN.findall(text)}
     for run in HAN_RUN.findall(text):
         units.update(run[index : index + 2] for index in range(max(0, len(run) - 1)))

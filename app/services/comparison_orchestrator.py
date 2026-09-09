@@ -18,7 +18,7 @@ from app.services.comparison_matrix_builder import ComparisonMatrixBuilder
 from app.services.structured_planner_model import PROTECTED_TOKEN_RE
 
 CITATION_RE = re.compile(r"\[C\d+\]")
-NUMBER_RE = re.compile(r"(?<![A-Za-z])\d+(?:\.\d+)*(?:\s*[A-Za-z%℃]+)?")
+NUMBER_CORE_RE = re.compile(r"\d+(?:\.\d+)*")
 
 
 class SummaryPayload(BaseModel):
@@ -121,9 +121,16 @@ class ComparisonOrchestrator:
 
     @staticmethod
     def _validate_summary(summary: str, matrix: str) -> None:
-        for extractor in (CITATION_RE.findall, NUMBER_RE.findall, PROTECTED_TOKEN_RE.findall):
+        # Citations and protected tokens (标准号/版本化条款号) must match exactly:
+        # the summary may not introduce new ones.
+        for extractor in (CITATION_RE.findall, PROTECTED_TOKEN_RE.findall):
             if set(extractor(summary)) - set(extractor(matrix)):
                 raise ValueError("summary introduced unsupported protected content")
+        # Numbers: tolerate reformatting (spacing/unit casing), but forbid any
+        # numeric value that is not already present in the verified matrix.
+        matrix_numbers = set(NUMBER_CORE_RE.findall(matrix))
+        if set(NUMBER_CORE_RE.findall(summary)) - matrix_numbers:
+            raise ValueError("summary introduced numbers not present in the matrix")
 
     @staticmethod
     def _read_prompt(relative_path: str) -> str:

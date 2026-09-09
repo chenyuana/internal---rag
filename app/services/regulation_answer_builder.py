@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from app.ingestion.regulations import extract_article_references
+from app.ingestion.regulations import match_article_heading
 from app.schemas.chat import CandidateClaim, StructuredAnswer
 from app.schemas.retrieval import NormalizedQuery, SelectedChunk
 
@@ -11,7 +11,7 @@ _HEADER_RE = re.compile(r"^(文档|章节|条号|页码)：", re.MULTILINE)
 _DOCUMENT_RE = re.compile(r"^文档：\s*(.+)$", re.MULTILINE)
 _ARTICLE_RE = re.compile(r"^条号：\s*(\S+)\s*$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^章节：\s*(.+)$", re.MULTILINE)
-_CLAUSE_RE = re.compile(r"(?m)^\(([a-d])\)\s*")
+_CLAUSE_RE = re.compile(r"(?m)^[ \t]*\(([a-z])\)[ \t]*")
 _ARTICLE_TITLE_RE = re.compile(
     r"第\s*[A-Za-z]?\d+(?:\.\d+)*\s*条\s*(.+)$",
     re.IGNORECASE,
@@ -37,8 +37,11 @@ def _header(pattern: re.Pattern[str], text: str) -> str | None:
 
 
 def _body(text: str) -> str:
-    parts = re.split(r"\r?\n\s*\r?\n", text, maxsplit=1)
-    return parts[1].strip() if len(parts) == 2 else text.strip()
+    # Blank lines are valid source paragraph boundaries, not proof of a header.
+    lines = text.splitlines()
+    while lines and (_HEADER_RE.match(lines[0]) or not lines[0].strip()):
+        lines.pop(0)
+    return "\n".join(lines).strip()
 
 
 def _trim_clause(text: str) -> str:
@@ -79,64 +82,81 @@ class RegulationAnswerBuilder:
             marker in query.original_query for marker in _REQUIREMENT_MARKERS
         ):
             return None
-        scopes = {
-            (
-                _header(_DOCUMENT_RE, chunk.text),
-                _header(_ARTICLE_RE, chunk.text),
+        if any(marker in query.original_query for marker in (
+            "发布日期", "生效日期", "评论", "收益", "成本", "目的", "为什么",
+        )):
+            return None
+        # 按来源（文档 + 条号/章节）分组，逐条提取要求原文（字母/数字分项或无分项）。
+        # fact 题纯确定性，LLM 不参与正文。
+        groups: dict[tuple[str, str, str], list[SelectedChunk]] = {}
+        for chunk in sorted(chunks, key=lambda c: (
+            c.document_id, c.metadata.page_number or 0, c.metadata.chunk_index or 0,
+        )):
+            document = _header(_DOCUMENT_RE, chunk.text) or chunk.metadata.document_name or ""
+            article = (
+                _header(_ARTICLE_RE, chunk.text)
+                or chunk.metadata.section_id
+                or _header(_SECTION_RE, chunk.text)
+                or chunk.metadata.chapter_path
+                or ""
             )
-            for chunk in chunks
-        }
-        if len(scopes) != 1:
-            return None
-        document, article = next(iter(scopes))
-        if not document or not article:
-            return None
-
-        section = _header(_SECTION_RE, chunks[0].text) or article
-        title = section.rsplit("/", maxsplit=1)[-1].strip()
-        title_match = _ARTICLE_TITLE_RE.search(title)
-        article_title = title_match.group(1).strip() if title_match else title
-        declared_articles = {
-            reference.normalized_id
-            for reference in extract_article_references(query.original_query)
-        }
-        normalized_title = _normalized_text(article_title)
-        if article not in declared_articles and (
-            len(normalized_title) < 4
-            or normalized_title not in _normalized_text(query.original_query)
-        ):
-            return None
-
-        clauses: dict[str, tuple[str, str]] = {}
-        for chunk in chunks:
-            body = _body(chunk.text)
-            matches = list(_CLAUSE_RE.finditer(body))
-            for index, match in enumerate(matches):
-                end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
-                clause = _trim_clause(body[match.start() : end])
-                if not clause:
-                    continue
-                letter = match.group(1)
-                existing = clauses.get(letter)
-                if existing is None or len(clause) > len(existing[0]):
-                    clauses[letter] = (clause, chunk.citation_id)
-        if not clauses:
-            return None
+            groups.setdefault((chunk.document_id, document, article), []).append(chunk)
 
         claims: list[CandidateClaim] = []
-        answer_parts = [
-            f"根据《{document.removesuffix('.pdf')}》{title}，以下按条文原文列示："
-        ]
-        for letter in sorted(clauses):
-            clause, citation_id = clauses[letter]
-            claims.append(
-                CandidateClaim(
-                    claim_id=f"article-{letter}",
-                    claim=clause,
-                    citation_ids=[citation_id],
+        answer_parts: list[str] = []
+        claim_index = 1
+        for (_, document, article), group_chunks in groups.items():
+            clauses: dict[str, tuple[str, str]] = {}
+            for chunk in group_chunks:
+                body = _body(chunk.text)
+                matches = list(_CLAUSE_RE.finditer(body))
+                if matches:
+                    preamble = _trim_clause(body[:matches[0].start()])
+                    preamble_lines = preamble.splitlines()
+                    if preamble_lines and match_article_heading(preamble_lines[0]):
+                        preamble = "\n".join(preamble_lines[1:]).strip()
+                    if preamble:
+                        clauses.setdefault(
+                            f"intro-{chunk.citation_id}", (preamble, chunk.citation_id),
+                        )
+                    for index, match in enumerate(matches):
+                        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+                        clause = _trim_clause(body[match.start() : end])
+                        if not clause:
+                            continue
+                        # Identically named paragraphs can span chunks. Keep
+                        # distinct continuations instead of choosing the longest
+                        # and silently deleting qualifications from the other.
+                        key = f"{match.group(1)}-{chunk.citation_id}-{index}"
+                        if not any(clause == value[0] for value in clauses.values()):
+                            clauses[key] = (clause, chunk.citation_id)
+                else:
+                    clause = _trim_clause(body)
+                    if clause:
+                        clauses.setdefault(
+                            f"plain-{chunk.citation_id}", (clause, chunk.citation_id),
+                        )
+            if not clauses:
+                continue
+            doc_label = document.removesuffix(".pdf") if document else ""
+            article_label = article.rsplit("/", maxsplit=1)[-1].strip() if article else ""
+            if doc_label and article_label:
+                answer_parts.append(f"【{doc_label} · {article_label}】")
+            elif doc_label or article_label:
+                answer_parts.append(f"【{doc_label or article_label}】")
+            for clause, citation_id in clauses.values():
+                claims.append(
+                    CandidateClaim(
+                        claim_id=f"fact-{claim_index}",
+                        claim=clause,
+                        citation_ids=[citation_id],
+                    )
                 )
-            )
-            answer_parts.append(f"{clause} [{citation_id}]")
+                claim_index += 1
+                answer_parts.append(f"{clause} [{citation_id}]")
+
+        if not claims:
+            return None
         return StructuredAnswer(
             answerability="ANSWERABLE",
             answer="\n\n".join(answer_parts),

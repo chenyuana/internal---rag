@@ -23,7 +23,7 @@ logging.getLogger("pdfminer").setLevel(logging.WARNING)
 
 
 TABLE_CAPTION_RE = re.compile(
-    r"^表\s*(?P<reference>(?:[A-Za-z]\s*[.\-]?\s*)?"
+    r"^(?:表\s*|Table\s+)(?P<reference>(?:[A-Za-z]\s*[.\-]?\s*)?"
     r"(?:\d+(?:[.\-]\d+)*|[一二三四五六七八九十]+))"
     r"(?:\s*[.、:：\-—])?\s*.*$",
     re.IGNORECASE,
@@ -165,6 +165,7 @@ class VectorBlock:
     table_title: str | None = None
     table_rows: list[list[str]] | None = None
     table_merged_cell_count: int = 0
+    table_header_only: bool = False
     asset_id: str | None = None
     asset_ids: list[str] = field(default_factory=list)
     confidence: float = 1.0
@@ -185,9 +186,19 @@ class VectorPageResult:
 @dataclass(slots=True)
 class VectorPreflightResult:
     table_pages: set[int] = field(default_factory=set)
-    table_series: list[list[int]] = field(default_factory=list)
+    table_series: list[list[int]] = field(default_factory=set)
     figure_pages: set[int] = field(default_factory=set)
     formula_pages: set[int] = field(default_factory=set)
+    # Native-text pages that carry an embedded *raster* table (the PDF marks it
+    # as a structure ``Figure`` content item but its cells live only in pixels,
+    # so vector grid detection finds no ruled grid and the table is otherwise
+    # dropped). These must be routed to remote OCR to recover the rows; treating
+    # them as ordinary figures only keeps a cropped image with no cell values.
+    raster_table_pages: set[int] = field(default_factory=set)
+    # Per raster-table page, the image bboxes (0..1000 normalized, reading
+    # order) classified as tables. The hybrid parser crops each region and
+    # re-OCRs it at higher resolution so small tables' digits are not blurred.
+    raster_table_boxes: dict[int, list[list[float]]] = field(default_factory=dict)
 
 
 class VectorPdfParser:
@@ -790,7 +801,16 @@ class VectorPdfParser:
                 used_captions.add(relevant[0][0])
                 results.append((bbox, rows, title))
 
-        return sorted(results, key=lambda item: (item[0][1], item[0][0]))
+        ordered = sorted(results, key=lambda item: (item[0][1], item[0][0]))
+        if ordered:
+            last_bbox, last_rows, last_title = ordered[-1]
+            extended_bbox, extended_rows = cls._extend_open_table_tail(
+                page,
+                last_bbox,
+                last_rows,
+            )
+            ordered[-1] = (extended_bbox, extended_rows, last_title)
+        return ordered
 
     @classmethod
     def _expanded_ruled_tables(
@@ -958,6 +978,24 @@ class VectorPdfParser:
             and table_height >= 18
         ):
             return True
+        # A ruled regulation table can be intentionally single-column: a
+        # centred heading followed by a wide, structured amendment entry.  PDF
+        # extractors represent its internal dotted leader / tab stop as text,
+        # not as a vertical rule, so requiring two extracted columns drops the
+        # entire boxed table back into prose.  Accept only a substantial wide
+        # frame with multiple populated rows and a non-trivial body cell. This
+        # still excludes narrow decoration and the short single-column appendix
+        # headings that are not tables.
+        if (
+            len(rows) >= 2
+            and width == 1
+            and populated >= 2
+            and table_width >= 300
+            and table_height >= 80
+            and max((len(normalize_cell(cell)) for row in rows for cell in row), default=0)
+            >= 24
+        ):
+            return True
         # A single-row table header with many columns is a real table too
         # (e.g. the "数据包格式" schematic in GB 46750-2025: one header row of
         # 数据类型/版本号/数据长度/…/数据内容项N). Accept it only when it is
@@ -1041,22 +1079,396 @@ class VectorPdfParser:
         )
 
     @classmethod
+    def _is_split_header(cls, page: Any, table: Any) -> bool:
+        """Accept a short ruled header only with a matching next-page body grid.
+
+        Check actual cell boundaries, not a filename or column count alone.
+        Standalone one-row boxes must remain excluded.
+        """
+        try:
+            rows = table.extract() or []
+            cells = table.rows[0].cells
+            if (
+                len(rows) != 1 or len(rows[0]) < 2
+                or any(not normalize_cell(c) for c in rows[0])
+                or any(not re.search(r"[A-Za-z\u3400-\u9fff]", normalize_cell(c))
+                       or re.match(r"^[\d$€£¥±+\-]", normalize_cell(c)) for c in rows[0])
+                or float(table.bbox[1]) < float(page.height) * 0.8
+                or page.page_number >= len(page.pdf.pages)
+                or any(cell is None for cell in cells)
+            ):
+                return False
+            following = page.pdf.pages[page.page_number]
+            for candidate in following.find_tables():
+                body = candidate.extract() or []
+                if (not cls._valid_table((cls._bbox(candidate.bbox), body))
+                        or float(candidate.bbox[1]) > float(following.height) * 0.15
+                        or len(body[0]) != len(rows[0])
+                        or not all(re.search(r"\d", normalize_cell(c)) for c in body[0])):
+                    continue
+                next_cells = candidate.rows[0].cells
+                if len(next_cells) != len(cells) or any(c is None for c in next_cells):
+                    continue
+                if all(
+                    abs(float(a[i]) / page.width - float(b[i]) / following.width) <= 0.01
+                    for a, b in zip(cells, next_cells, strict=True) for i in (0, 2)
+                ):
+                    return True
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return False
+        return False
+
+    @staticmethod
+    def _cluster_positions(values: Sequence[float], *, tolerance: float = 3.0) -> list[float]:
+        """Collapse duplicate PDF rule coordinates into one grid position."""
+
+        clusters: list[list[float]] = []
+        for value in sorted(float(item) for item in values):
+            if clusters and value - clusters[-1][-1] <= tolerance:
+                clusters[-1].append(value)
+            else:
+                clusters.append([value])
+        return [sum(cluster) / len(cluster) for cluster in clusters]
+
+    @classmethod
+    def _grid_columns(
+        cls,
+        page: Any,
+        bbox: Sequence[float],
+        width: int,
+    ) -> list[float]:
+        """Return the vertical grid boundaries for a ruled table."""
+
+        left, _top, right, _bottom = (float(value) for value in bbox)
+        positions: list[float] = []
+        for edge in getattr(page, "edges", []) or []:
+            try:
+                x0, x1 = float(edge["x0"]), float(edge["x1"])
+                edge_top, edge_bottom = float(edge["top"]), float(edge["bottom"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if abs(x1 - x0) > 1.5 or edge_bottom - edge_top < 20:
+                continue
+            if left - 5 <= x0 <= right + 5:
+                positions.append(x0)
+        clustered = cls._cluster_positions(positions)
+        if len(clustered) >= width + 1:
+            # Prefer the outermost set that spans the detected table width. A
+            # page may carry an unrelated narrow ruled box beside the table.
+            in_range = [value for value in clustered if left - 5 <= value <= right + 5]
+            if len(in_range) >= width + 1:
+                return in_range[: width + 1]
+        step = (right - left) / max(1, width)
+        return [left + step * index for index in range(width + 1)]
+
+    @classmethod
+    def _open_table_tail(
+        cls,
+        page: Any,
+        bbox: Sequence[float],
+        width: int,
+    ) -> tuple[list[float], list[float]] | None:
+        """Find a table row whose bottom border continues past this page.
+
+        A PDF table can be cut at a page boundary without a complete rectangle
+        on either page. In that case pdfplumber returns the completed rows only
+        and leaves the final row as ordinary text. The continued vertical rules
+        are stronger evidence than text alone, so use them to recover that
+        open row conservatively.
+        """
+
+        if width < 2:
+            return None
+        page_height = float(getattr(page, "height", 0.0) or 0.0)
+        if page_height <= 0:
+            return None
+        left, _top, right, bottom = (float(value) for value in bbox)
+        columns = cls._grid_columns(page, bbox, width)
+        if len(columns) != width + 1:
+            return None
+        continuations: list[tuple[float, float]] = []
+        for column in columns:
+            segments: list[tuple[float, float]] = []
+            for edge in getattr(page, "edges", []) or []:
+                try:
+                    x0, x1 = float(edge["x0"]), float(edge["x1"])
+                    edge_top, edge_bottom = float(edge["top"]), float(edge["bottom"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if (
+                    abs(x1 - x0) <= 1.5
+                    and abs(x0 - column) <= 3.0
+                    and bottom - 4 <= edge_top <= bottom + 4
+                    and edge_bottom > bottom + 40
+                ):
+                    segments.append((edge_top, edge_bottom))
+            if not segments:
+                continue
+            continuations.append(max(segments, key=lambda value: value[1]))
+        if len(continuations) < width + 1:
+            return None
+        tail_top = min(value[0] for value in continuations)
+        tail_bottom = max(value[1] for value in continuations)
+        # Do not consume an ordinary paragraph block halfway down a page. An
+        # open row should reach the footer margin, as the source grid does.
+        if tail_bottom < page_height * 0.85:
+            return None
+        if tail_top < bottom - 5:
+            return None
+        return [left, tail_top, right, tail_bottom], columns
+
+    @classmethod
+    def _continuation_grid(
+        cls,
+        page: Any,
+        columns: Sequence[float],
+    ) -> list[float] | None:
+        """Find a top-of-page grid fragment matching ``columns``."""
+
+        if len(columns) < 3:
+            return None
+        left, right = float(columns[0]), float(columns[-1])
+        page_height = float(getattr(page, "height", 0.0) or 0.0)
+        if page_height <= 0:
+            return None
+        matched = 0
+        vertical_bottom = 0.0
+        for column in columns:
+            segments: list[float] = []
+            for edge in getattr(page, "edges", []) or []:
+                try:
+                    x0, x1 = float(edge["x0"]), float(edge["x1"])
+                    edge_top, edge_bottom = float(edge["top"]), float(edge["bottom"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if (
+                    abs(x1 - x0) <= 1.5
+                    and abs(x0 - column) <= 3.0
+                    and edge_top <= 55
+                    and edge_bottom - edge_top >= 35
+                ):
+                    segments.append(edge_bottom)
+            if segments:
+                matched += 1
+                vertical_bottom = max(vertical_bottom, max(segments))
+        if matched != len(columns):
+            return None
+        horizontal: list[float] = []
+        segmented_horizontal: list[tuple[float, float, float]] = []
+        for edge in getattr(page, "edges", []) or []:
+            try:
+                x0, x1 = float(edge["x0"]), float(edge["x1"])
+                edge_top, edge_bottom = float(edge["top"]), float(edge["bottom"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                abs(edge_bottom - edge_top) <= 1.5
+                and edge_top >= 20
+                and edge_top <= page_height * 0.65
+            ):
+                y = (edge_top + edge_bottom) / 2
+                if (
+                    x0 <= left + 3
+                    and x1 >= right - 3
+                    and x1 - x0 >= (right - left) * 0.8
+                ):
+                    horizontal.append(y)
+                # Some PDF generators draw a row boundary as one segment per
+                # cell rather than a single full-width rule. Keep those
+                # segments so a continuation crop stops at the first row
+                # boundary instead of swallowing the next row.
+                if x1 > left and x0 < right and x1 - x0 >= 8:
+                    segmented_horizontal.append(
+                        (y, max(left, x0), min(right, x1))
+                    )
+        if segmented_horizontal:
+            by_y: list[list[tuple[float, float, float]]] = []
+            for segment in sorted(segmented_horizontal):
+                if not by_y or segment[0] - by_y[-1][-1][0] > 1.5:
+                    by_y.append([segment])
+                else:
+                    by_y[-1].append(segment)
+            for group in by_y:
+                coverage = 0.0
+                cursor: float | None = None
+                for start, end in sorted((item[1], item[2]) for item in group):
+                    if cursor is None:
+                        cursor = end
+                        coverage = end - start
+                    elif start >= cursor:
+                        coverage += end - start
+                        cursor = end
+                    elif end > cursor:
+                        coverage += end - cursor
+                        cursor = end
+                if coverage >= (right - left) * 0.85:
+                    horizontal.append(sum(item[0] for item in group) / len(group))
+        if not horizontal:
+            return None
+        top_candidates: list[float] = []
+        for edge in getattr(page, "edges", []) or []:
+            try:
+                x0, x1 = float(edge["x0"]), float(edge["x1"])
+                edge_top = float(edge["top"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                abs(x1 - x0) <= 1.5
+                and abs(x0 - left) <= 3.0
+                and edge_top <= 55
+            ):
+                top_candidates.append(edge_top)
+        if not top_candidates:
+            return None
+        top = min(top_candidates)
+        # The first horizontal rule after the top boundary closes the
+        # continuation row. If no internal rule is available, retain the old
+        # behavior and use the last full-width rule.
+        row_boundaries = sorted(value for value in horizontal if value > top + 5)
+        bottom = row_boundaries[0] if row_boundaries else max(horizontal)
+        bottom = min(bottom, vertical_bottom)
+        if bottom <= 30:
+            return None
+        return [left, min(55.0, max(0.0, top)), right, bottom]
+
+    @classmethod
+    def _grid_row_text(
+        cls,
+        page: Any,
+        bbox: Sequence[float],
+        columns: Sequence[float],
+    ) -> list[str]:
+        """Extract one row by cell boundaries, preserving wrapped text."""
+
+        top, bottom = float(bbox[1]), float(bbox[3])
+        cells: list[str] = []
+        for left, right in zip(columns, columns[1:], strict=False):
+            text = cls._smart_cell_text(
+                page,
+                [float(left) + 0.5, top + 0.5, float(right) - 0.5, bottom - 0.5],
+            )
+            cells.append(normalize_cell(text))
+        return cells
+
+    @classmethod
+    def _extend_open_table_tail(
+        cls,
+        page: Any,
+        bbox: Sequence[float],
+        rows: list[list[object | None]],
+    ) -> tuple[list[float], list[list[object | None]]]:
+        """Append the unfinished bottom row when the next page continues it."""
+
+        if not rows:
+            return list(bbox), rows
+        width = max((len(row) for row in rows), default=0)
+        tail = cls._open_table_tail(page, bbox, width)
+        if tail is None:
+            return list(bbox), rows
+        tail_bbox, columns = tail
+        next_page_number = int(getattr(page, "page_number", 0) or 0) + 1
+        pages = getattr(getattr(page, "pdf", None), "pages", []) or []
+        if next_page_number < 1 or next_page_number > len(pages):
+            return list(bbox), rows
+        next_page = pages[next_page_number - 1]
+        if cls._continuation_grid(next_page, columns) is None:
+            return list(bbox), rows
+        row = cls._grid_row_text(page, tail_bbox, columns)
+        if not any(cell.strip() for cell in row):
+            return list(bbox), rows
+        extended_bbox = [
+            float(bbox[0]),
+            float(bbox[1]),
+            float(bbox[2]),
+            float(tail_bbox[3]),
+        ]
+        return extended_bbox, [*rows, row]
+
+    @classmethod
+    def _extract_open_table_continuation(
+        cls,
+        page: Any,
+    ) -> tuple[list[float], list[list[object | None]], str] | None:
+        """Extract a continuation row when the page has no closed table grid."""
+
+        page_number = int(getattr(page, "page_number", 0) or 0)
+        pages = getattr(getattr(page, "pdf", None), "pages", []) or []
+        if page_number <= 1 or page_number > len(pages):
+            return None
+        previous = pages[page_number - 2]
+        previous_tables = cls._extract_best_tables(previous)
+        if not previous_tables:
+            return None
+        previous_bbox, previous_rows = max(
+            previous_tables,
+            key=lambda item: item[0][3],
+        )
+        width = max((len(row) for row in previous_rows), default=0)
+        tail = cls._open_table_tail(previous, previous_bbox, width)
+        if tail is None:
+            return None
+        _tail_bbox, columns = tail
+        continuation_bbox = cls._continuation_grid(page, columns)
+        if continuation_bbox is None:
+            return None
+        row = cls._grid_row_text(page, continuation_bbox, columns)
+        if not any(cell.strip() for cell in row):
+            return None
+        return continuation_bbox, [row], ""
+
+    @classmethod
+    def _extract_following_table_fragments(
+        cls,
+        page: Any,
+        continuation_bbox: Sequence[float],
+        width: int,
+    ) -> list[tuple[list[float], list[list[object | None]], str]]:
+        """Recover ordinary rows drawn below an open continuation row.
+
+        A page can start with the tail of a row from the previous page and
+        immediately follow it with a complete one-row table fragment. The
+        normal table validator intentionally rejects isolated one-row grids;
+        here the continuation geometry provides the missing context, so only
+        same-width rows below that geometry are accepted.
+        """
+
+        if width < 2:
+            return []
+        results: list[tuple[list[float], list[list[object | None]], str]] = []
+        try:
+            tables = page.find_tables()
+        except (AttributeError, TypeError, ValueError):
+            return results
+        continuation_bottom = float(continuation_bbox[3])
+        for table in tables:
+            try:
+                bbox = cls._bbox(table.bbox)
+                rows = cls._rebuild_cells(page, table)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if bbox[1] < continuation_bottom - 3 or len(rows) != 1:
+                continue
+            row = rows[0]
+            if len(row) != width or sum(bool(normalize_cell(cell)) for cell in row) < 2:
+                continue
+            if bbox[3] - bbox[1] < 12 or bbox[2] - bbox[0] < 40:
+                continue
+            results.append((bbox, rows, ""))
+        return sorted(results, key=lambda item: (item[0][1], item[0][0]))
+
+    @classmethod
     def _extract_best_tables(
         cls,
         page: Any,
     ) -> list[tuple[list[float], list[list[object | None]]]]:
         detected: list[tuple[list[float], list[list[object | None]]]] = []
         try:
-            detected = [
-                (
-                    cls._bbox(table.bbox),
-                    cls._rebuild_cells(page, table),
-                )
-                for table in page.find_tables()
-            ]
+            for table in page.find_tables():
+                candidate = (cls._bbox(table.bbox), cls._rebuild_cells(page, table))
+                if cls._valid_table(candidate) or cls._is_split_header(page, table):
+                    detected.append(candidate)
         except (AttributeError, TypeError, ValueError):
             detected = []
-        detected = [table for table in detected if cls._valid_table(table)]
 
         try:
             expanded = cls._expanded_ruled_tables(page)
@@ -1088,6 +1500,23 @@ class VectorPdfParser:
             cx = (float(ch["x0"]) + float(ch["x1"])) / 2
             cy = (float(ch["top"]) + float(ch["bottom"])) / 2
             if left <= cx <= right and top <= cy <= bottom:
+                # Browser PDFs sometimes draw the equality stroke of <= / >=
+                # separately from the text glyph. Preserve that source mark,
+                # but never interpret long underlines or cell borders as math.
+                value = str(ch["text"])
+                if value in {"<", ">"}:
+                    size = float(ch.get("size", 12))
+                    width = float(ch["x1"]) - float(ch["x0"])
+                    for mark in getattr(page, "rects", []) or []:
+                        if (
+                            0 < float(mark["bottom"]) - float(mark["top"]) <= size * 0.12
+                            and 0 <= float(mark["top"]) - float(ch["bottom"]) <= size * 0.15
+                            and width * 0.8 <= float(mark["x1"]) - float(mark["x0"]) <= width * 2
+                            and abs(float(mark["x0"]) - float(ch["x0"])) <= width * 0.5
+                            and float(mark["x1"]) >= float(ch["x1"]) - width * 0.1
+                        ):
+                            ch = {**ch, "text": "≤" if value == "<" else "≥"}
+                            break
                 chars.append(ch)
         if not chars:
             return ""
@@ -1305,6 +1734,27 @@ class VectorPdfParser:
             return True
         return False
 
+
+    @staticmethod
+    def _has_body_vector_content(page: Any) -> bool:
+        """Whether a page has vector content in the body (not only margins).
+
+        Blank spacer pages carry a running header and page number as tiny vector
+        elements in the top/bottom margins (e.g. a blank page between sections).
+        Those are page furniture, not figure content.  A real diagram occupies
+        the page body, i.e. outside the narrow header/footer marginal bands.
+        """
+        height = float(getattr(page, "height", 0.0) or 0.0)
+        if height <= 0:
+            return False
+        lower, upper = height * 0.08, height * 0.92
+        for key in ("lines", "rects", "curves"):
+            for item in getattr(page, key, None) or []:
+                top = float(getattr(item, "top", 0.0))
+                bottom = float(getattr(item, "bottom", top))
+                if lower < (top + bottom) / 2.0 < upper:
+                    return True
+        return False
 
     @staticmethod
     def _boxed_text_diagram_region(page: Any) -> list[float] | None:
@@ -1542,7 +1992,73 @@ class VectorPdfParser:
                 boxed_text_diagram = bool(
                     self._boxed_text_diagram_region(page)
                 )
-                if (
+                # Some regulations introduce a graph inline ("shown in the
+                # following figure") rather than below a conventional "Figure"
+                # caption.  Its raster is often small relative to a text-heavy
+                # page, so image coverage alone misses it.
+                has_inline_figure_reference = bool(
+                    re.search(
+                        r"\b(?:shown in (?:the )?following figure|following figure shows)\b",
+                        page_text,
+                        re.IGNORECASE,
+                    )
+                )
+                # Native-text regulations sometimes render a *table* as a raster
+                # image on an otherwise text-layer page (e.g. an FAA NPRM page
+                # carrying a bird-weight table, "TABLE 1", "TABLE 2", "TABLE 3"
+                # grids). Its cells exist only in pixels, so the vector-grid /
+                # figure path can never recover the rows — only remote OCR can.
+                #
+                # The PDF itself tags these as structure ``Figure`` content
+                # items (pdfplumber exposes ``image.tag``), while an untagged
+                # logo, stamp, or background does not carry that marker. A real
+                # illustration, in contrast, has an explicit figure signal: a
+                # 图N caption, an inline "shown in the following figure"
+                # reference, a flow chart, or a boxed diagram. When a page
+                # carries a structurally-tagged ``Figure`` raster and NONE of
+                # those explicit figure signals, it is overwhelmingly a raster
+                # table on a text page — route it to OCR (``raster_table_pages``)
+                # regardless of coverage, so the rows are recovered instead of
+                # a cropped image with no cell values. Coverage must not win
+                # here: a text page can stack several wide-but-short raster
+                # tables (e.g. page 25 of 23-54-DRS_98-19 carries TABLE 2,
+                # TABLE 3 and the 33.77(e) grid at ~39% combined coverage).
+                has_structured_figure_content = any(
+                    not self._is_fullpage_background_image(page, image)
+                    and str(image.get("tag") or "").rstrip() == "Figure"
+                    for image in getattr(page, "images", []) or []
+                )
+                explicit_figure_signal = bool(
+                    has_figure_caption
+                    or (
+                        has_inline_figure_reference
+                        and image_coverage >= 0.025
+                    )
+                    or (has_figure_caption and pure_vector_flow)
+                    or (has_figure_caption and boxed_text_diagram)
+                )
+                if has_structured_figure_content and not explicit_figure_signal:
+                    result.raster_table_pages.add(page_number)
+                    page_width = float(getattr(page, "width", 0) or 0)
+                    page_height = float(getattr(page, "height", 0) or 0)
+                    boxes: list[list[float]] = []
+                    for image in getattr(page, "images", []) or []:
+                        if self._is_fullpage_background_image(page, image):
+                            continue
+                        if str(image.get("tag") or "").rstrip() != "Figure":
+                            continue
+                        if page_width <= 0 or page_height <= 0:
+                            continue
+                        # crop_table_pdf expects a 0..1000 normalized bbox;
+                        # pdfplumber reports image corners in page points.
+                        boxes.append([
+                            round(float(image["x0"]) / page_width * 1000, 2),
+                            round(float(image["top"]) / page_height * 1000, 2),
+                            round(float(image["x1"]) / page_width * 1000, 2),
+                            round(float(image["bottom"]) / page_height * 1000, 2),
+                        ])
+                    result.raster_table_boxes[page_number] = boxes
+                elif (
                     substantive_image_count
                     and (
                         largest_image_coverage >= 0.12
@@ -1551,6 +2067,10 @@ class VectorPdfParser:
                             and len(compact_text) < 300
                         )
                         or has_figure_caption
+                        or (
+                            has_inline_figure_reference
+                            and image_coverage >= 0.025
+                        )
                     )
                 ) or (
                     has_figure_caption and pure_vector_flow
@@ -1606,6 +2126,40 @@ class VectorPdfParser:
                 # exact grid instead of degrading it through OCR.
                 elif self._has_math_font(page) and not has_structured_table:
                     result.formula_pages.add(page_number)
+            # A table whose vertical rules continue below the last detected
+            # row can have an otherwise ordinary-looking next page: there is
+            # no closed rectangle for ``find_tables`` to return. Promote that
+            # page to a table candidate so ``parse_pages`` can recover the
+            # open row from its matching top-of-page grid.
+            changed = True
+            while changed:
+                changed = False
+                for page_number in sorted(result.table_pages):
+                    next_page_number = page_number + 1
+                    if next_page_number not in candidate_pages:
+                        continue
+                    if next_page_number > len(pdf.pages):
+                        continue
+                    previous = pdf.pages[page_number - 1]
+                    following = pdf.pages[next_page_number - 1]
+                    previous_tables = self._extract_best_tables(previous)
+                    if not previous_tables:
+                        continue
+                    previous_bbox, previous_rows = max(
+                        previous_tables,
+                        key=lambda item: item[0][3],
+                    )
+                    width = max((len(row) for row in previous_rows), default=0)
+                    tail = self._open_table_tail(previous, previous_bbox, width)
+                    if tail is None:
+                        continue
+                    _tail_bbox, columns = tail
+                    if (
+                        next_page_number not in result.table_pages
+                        and self._continuation_grid(following, columns) is not None
+                    ):
+                        result.table_pages.add(next_page_number)
+                        changed = True
         result.table_series = self.contiguous_series(result.table_pages)
         return result
 
@@ -1685,7 +2239,11 @@ class VectorPdfParser:
                     or result.image_coverage >= 0.15
                 ):
                     result.page_type = "figure"
-                elif has_visual_content:
+                elif has_visual_content and (
+                    page_text
+                    or image_boxes
+                    or self._has_body_vector_content(page)
+                ):
                     result.page_type = "figure"
                 else:
                     result.page_type = "blank"
@@ -1708,6 +2266,21 @@ class VectorPdfParser:
                         result.warnings.append(
                             f"Vector table detection failed: {type(exc).__name__}: {exc}"
                         )
+                    if not captioned_tables:
+                        continuation = self._extract_open_table_continuation(page)
+                        if continuation is not None:
+                            captioned_tables = [continuation]
+                            continuation_bbox, continuation_rows, _ = continuation
+                            captioned_tables.extend(
+                                self._extract_following_table_fragments(
+                                    page,
+                                    continuation_bbox,
+                                    max(
+                                        (len(row) for row in continuation_rows),
+                                        default=0,
+                                    ),
+                                )
+                            )
                     for ordinal, (table_bbox, rows, table_title) in enumerate(
                         captioned_tables,
                         start=1,
@@ -1768,6 +2341,7 @@ class VectorPdfParser:
                                     else None
                                 ),
                                 table_rows=normalized_rows,
+                                table_header_only=len(normalized_rows) == 1,
                                 table_merged_cell_count=sum(
                                     cell is None for row in rows for cell in row
                                 ),
@@ -1801,9 +2375,12 @@ class VectorPdfParser:
                         )
 
                 if (
-                    (page_number in figure_pages and has_visual_content)
-                    or page_number in formula_pages
-                    or result.table_count
+                    result.page_type != "blank"
+                    and (
+                        (page_number in figure_pages and has_visual_content)
+                        or page_number in formula_pages
+                        or result.table_count
+                    )
                 ):
                     try:
                         page_png = self._render_page(page)

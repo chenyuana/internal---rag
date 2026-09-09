@@ -96,7 +96,8 @@ class OpenAICompatibleModelClient:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         self.model_name = settings.model_name
-        self._uses_deepseek_v4_thinking = settings.model_name.startswith("deepseek-v4-")
+        self._is_deepseek_v4 = settings.model_name.startswith("deepseek-v4-")
+        self._enable_thinking = settings.thinking
         self.temperature = settings.temperature
         self.seed = settings.seed
         self.max_output_tokens = settings.max_output_tokens
@@ -182,12 +183,14 @@ class OpenAICompatibleModelClient:
                 },
             },
         }
-        if self._uses_deepseek_v4_thinking:
-            # DeepSeek V4 enables thinking by default. Its Chat Completions API
-            # uses this object (rather than Ollama's ``think`` boolean) to turn
-            # reasoning off, so the bounded output budget is reserved for the
+        if self._is_deepseek_v4:
+            # DeepSeek V4 supports explicit thinking control via this object.
+            # Enabled when the endpoint opts in (config `thinking`), disabled
+            # otherwise so the bounded output budget is reserved for the
             # required structured final answer.
-            payload["thinking"] = {"type": "disabled"}
+            payload["thinking"] = {"type": "enabled" if self._enable_thinking else "disabled"}
+        elif self._enable_thinking:
+            payload["reasoning_effort"] = "high"
         else:
             payload["reasoning_effort"] = "none"
         if self.seed is not None:
@@ -214,7 +217,7 @@ class OpenAICompatibleModelClient:
         # falls back from json_schema to json_object when necessary.
         recovery = copy.deepcopy(payload)
         recovery.pop("seed", None)
-        if self._uses_deepseek_v4_thinking:
+        if self._is_deepseek_v4:
             recovery["thinking"] = {"type": "disabled"}
         else:
             recovery["think"] = False

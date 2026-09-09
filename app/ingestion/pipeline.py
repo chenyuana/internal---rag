@@ -28,6 +28,7 @@ from app.ingestion.regulations import (
     extract_keywords,
     match_article_heading,
 )
+from app.ingestion.regulatory_structure import expand_regulatory_blocks
 
 TEXT_PAGE_MIN_CHARS = 30
 REPEATED_MARGIN_FRACTION = 0.25
@@ -58,6 +59,49 @@ FORM_PAGE_PLACEHOLDER_RE = re.compile(r"^.{0,12}[第编]?\d*[页]\s*[，,]\s*共
 # Damaged fonts map "GB/T" to CJK fake glyphs such as 犌犅/犜—. These repeat as
 # headers on every page and must be removed from indexable text.
 FAKE_GB_HEADER_RE = re.compile(r"^犌犅[／/]犜.*$")
+# Federal Register (GPO) running page header. Every GPO-set Federal Register
+# page begins with "<FR page no> Federal Register / Vol. V, No. N / Weekday,
+# Month D, YYYY / <section>" (e.g. "41522 Federal Register / Vol. 74, No. 157 /
+# Monday, August 17, 2009 / Proposed Rules"). It is a running header, not
+# document content, and glues onto the first body paragraph on single-stream
+# pages, so it must be dropped in the top margin band.
+FEDERAL_REGISTER_HEADER_RE = re.compile(
+    r"^\d{5}\s+Federal Register\s*/\s*Vol\.\s*\d+\s*,\s*No\.\s*\d+\s*/\s*"
+    r"[A-Z][a-z]+day,\s*[A-Z][a-z]+ \d{1,2},\s*\d{4}\s*/\s*"
+    r"[A-Z][A-Za-z ]+$"
+)
+# Federal Register (GPO) production footer stamp. Every page ends with a print
+# run line: "VerDate Nov<24>2008 18:20 Aug 14, 2009 Jkt 217001 PO 00000 Frm
+# NNNNN Fmt NNNN Sfmt NNNN E:\FR\FM\17AUP2.SGM 17AUP2". The "Frm/Fmt/Sfmt"
+# numbers change every page so the repeated-margin-key detector cannot catch
+# it; on single-stream pages the stamp glues onto the last body line, so we
+# cut everything from "VerDate" onward.
+FEDERAL_REGISTER_STAMP_RE = re.compile(
+    r"VerDate\s+\S+\s+\d{1,2}:\d{2}\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4}\s+"
+    r"Jkt\s+\d+\s+PO\s+\d+\s+Frm\s+\d+\s+Fmt\s+\d+\s+Sfmt\s+\d+\s+"
+    r"[A-Za-z]:\\[^\s]*\.SGM"
+)
+# Figure placeholder lines on figure pages, e.g. "EP17AU09.006</GPH>" or the
+# pair "EP17AU09.004</GPH> EP17AU09.005</GPH>". They trail the stamp and carry
+# no retrieval value.
+FEDERAL_REGISTER_GPH_LINE_RE = re.compile(r"^(?:\S+</?GPH>\s*)+$")
+# Operator tail of the FR footer: "<operator> on <WORKSTATION> with PROPOSALSn".
+# On figure pages it is emitted as its own line after the stamp.
+FEDERAL_REGISTER_OPERATOR_TAIL_RE = re.compile(
+    r"^[A-Za-z0-9]+ on [A-Z0-9]+ with [A-Z]+\d*$"
+)
+# Federal Register bottom-of-page footnotes. They physically sit in the
+# footnote band at the bottom of the page, but pypdf pulls them to the top of
+# the extraction (right after the running header), where clean_page would glue
+# them onto the first body line. A footnote line is "<n> <citation>", the
+# citation being an FR reference such as "1 68 FR 5488", "3 60 FR 65832 and
+# 61 FR 2608." or a "See"/"Id." cross-reference. Relocate these to the end of
+# the page so the body starts cleanly while the real citations are kept.
+FEDERAL_REGISTER_FOOTNOTE_RE = re.compile(
+    r"^\d{1,2}\s+(?:\d{1,3}\s+)?FR\s+\d+"
+    r"|^\d{1,2}\s+See\b"
+    r"|^\d{1,2}\s+Id\."
+)
 TABLE_TITLE_RE = re.compile(r"^\s*表\s*[A-Za-z0-9一二三四五六七八九十.-]+\s+.+")
 # Prose references to a table like "表 A.6 的要求" / "表A.5 的规定" are NOT
 # table titles — they are sentences that mention a table. Treating them as
@@ -137,6 +181,31 @@ CLAUSE_ASSERTION_RE = re.compile(
 CLAUSE_SENTENCE_END_RE = re.compile(r"[。！？；.!?;][\"'”’）)]*$")
 
 HEADING_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "annex",
+        # Federal Register amendment/appendix boundaries: the amendatory
+        # listing items that open an appendix ("63. Amend Appendix F to Part
+        # 23 as follows:") or restructure it ("A. Redesignate the existing
+        # text as Part I...", "B. Add a new Part II. Appendix F to Part
+        # 23--Test Method To Determine the Flammability and Flame
+        # Propagation Characteristics of Thermal/Acoustic Insulation").
+        # These reset the running FR section header (e.g. "Sec. 23.1587 ..."
+        # from the page) so appendix test-method content (figures,
+        # (a) Definitions, (h) Requirements) is NOT attributed to the section
+        # being amended. Without this the criteria chunks would be published
+        # as ``23.1587(H)(1)`` instead of ``Appendix F``.
+        re.compile(r"^\s*\d{1,3}\s*\.\s*Amend\s+Appendix\b", re.IGNORECASE),
+    ),
+    (
+        "annex",
+        re.compile(
+            r"^\s*[A-Z]\s*\.\s*(?:Redesignate the existing text as Part\b"
+            r"|Add a new Part\b.*\bAppendix\s+[A-Z0-9]+\s+to\s+Part\s+\d+\b.*"
+            r"(?:Test\s+Method|Test\s+Procedure|Flammability|Flame\s+Propagation|"
+            r"Thermal/Acoustic\s+Insulation))",
+            re.IGNORECASE,
+        ),
+    ),
     (
         "chapter",
         re.compile(r"^\s*第\s*[一二三四五六七八九十百零〇0-9]+\s*章(?:\s+|$)"),
@@ -269,6 +338,7 @@ class ChunkRecord:
     # Raw LaTeX for formula blocks in this chunk. The cleaned `text` drives
     # retrieval; the LaTeX is published as metadata for faithful rendering.
     formula_latex: list[str] = field(default_factory=list)
+    related_chunks: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -471,8 +541,222 @@ def table_to_html(rows: list[list[str]], *, header_rows: int = 1) -> str:
     return "<table>" + "".join(body) + "</table>"
 
 
+# ---------------------------------------------------------------------------
+# General OR-alternative / merged-cell row reconstruction.
+#
+# A common table-extraction failure: the upstream model flattens a row that is
+# really *two* logical rows (two alternatives of one parameter, joined by "OR")
+# into a single row whose cells are the concatenation of the two alternatives.
+# Example (from scanned FAA recorder-spec tables):
+#   ["Stabilizer Trim PositionORPitch Control Position", "Full RangeFull Range",
+#    "±3% unless higheruniquely required±3% unless higheruniquely required",
+#    "11", "1%.1%."]
+# should become two rows:
+#   ["Stabilizer Trim Position", "Full Range", "±3% unless higher uniquely required", "1", "1%"]
+#   ["Pitch Control Position",   "Full Range", "±3% unless higher uniquely required", "1", "1%"]
+#
+# The reconstruction is intentionally *conservative* and document-agnostic: a
+# row is only split when the fusion is unambiguous.  Because the concatenation
+# is lossy, a split is only accepted when every cell besides the one holding the
+# "OR" separator is empty or an *exact even repetition* (so both alternatives
+# share the same value there).  Ambiguous fusions are left untouched and
+# reported so callers can route the table to visual review instead of publishing
+# a value that may be wrong.
+# ---------------------------------------------------------------------------
+
+
+def _or_alternative_candidates(text: str):
+    """Yield (start, end, left, right) for 'or' tokens that separate two
+    multi-word label-like chunks.
+
+    A plausible parameter-alternative separator must split into two labels with
+    at least 4 alphanumeric chars each *and* a space on both sides.  This keeps
+    value-level uses of "or" (``±60° or 100%``, ``4 (or 1 per second …)``) and
+    single-word labels (``Discrete or Analog``) out of consideration.
+    """
+    if not text:
+        return
+    # Only an uppercase OCR token fused to neighbouring text (``PositionORPitch``
+    # or ``Certification.ORProp``), or an OR isolated on its own source line,
+    # is structural evidence.  Ordinary prose/value uses such as ``Flap Or
+    # Cockpit Control``, ``Fan or N1`` and ``0.5 or 0.25`` are not candidates.
+    # MinerU normally preserves the source's all-caps alternative marker even
+    # when it removes the surrounding line breaks.
+    for match in re.finditer(r"OR", text):
+        before = text[match.start() - 1] if match.start() else ""
+        after = text[match.end()] if match.end() < len(text) else ""
+        fused = bool(before and not before.isspace()) or bool(after and not after.isspace())
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        if line_end < 0:
+            line_end = len(text)
+        isolated_line = text[line_start:line_end].strip().casefold() == "or"
+        if not (fused or isolated_line):
+            continue
+        left = text[: match.start()].strip(" ,.;()\"'")
+        right = text[match.end():].strip(" ,.;()\"'")
+        left_alnum = sum(ch.isalnum() for ch in left)
+        right_alnum = sum(ch.isalnum() for ch in right)
+        if (
+            left_alnum >= 4
+            and right_alnum >= 4
+            and " " in left
+            and " " in right
+        ):
+            yield match.start(), match.end(), left, right
+
+
+def _even_repeat(text: str) -> str | None:
+    """Return one half only when ``text`` is exactly two identical halves.
+
+    The normalizer reconstructs two alternatives, so accepting three or more
+    repeated units would silently discard data.  Restricting this to two halves
+    also prevents arbitrary periodic strings from being treated as evidence.
+    """
+    compact = re.sub(r"\s+", " ", text.strip())
+    if not compact or len(compact) % 2:
+        return None
+    half = len(compact) // 2
+    candidate = compact[:half]
+    return candidate if candidate and compact[half:] == candidate else None
+
+
+def _split_or_alternative_row(row: list[object]) -> list[list[object]] | None:
+    """Split one flattened OR-alternative row into two rows, or None if it is
+    not an unambiguous fusion (a plain row, or an ambiguous fusion)."""
+    if not row:
+        return None
+    row = list(row)
+    for split_col in range(len(row)):
+        for _start, _end, left, right in _or_alternative_candidates(str(row[split_col])):
+            halves: dict[int, tuple[object, object]] = {}
+            ok = True
+            supporting_columns = 0
+            for col in range(len(row)):
+                if col == split_col:
+                    continue
+                normalized = re.sub(r"\s+", " ", str(row[col]).strip())
+                if not normalized:
+                    halves[col] = ("", "")
+                    continue
+                shared = _even_repeat(normalized)
+                if shared is None:
+                    ok = False
+                    break
+                halves[col] = (shared, shared)
+                supporting_columns += 1
+            # A single doubled neighbour is too weak: it may be a duplicated
+            # OCR token next to an otherwise ordinary label.  Require two
+            # independent value columns to corroborate the two-row topology.
+            if not ok or supporting_columns < 2:
+                continue
+            first = list(row[:split_col]) + [left]
+            second = list(row[:split_col]) + [right]
+            for col in range(split_col + 1, len(row)):
+                first.append(halves[col][0])
+                second.append(halves[col][1])
+            return [first, second]
+    return None
+
+
+def split_merged_or_rows(
+    rows: list[list[object]],
+) -> tuple[list[list[object]], bool]:
+    """Split flattened OR-alternative rows into two logical rows.
+
+    Returns ``(new_rows, has_ambiguous_or_row)``.  Unambiguous fusions are split
+    into two rows; ambiguous fusions and ordinary rows are passed through
+    unchanged.  ``has_ambiguous_or_row`` is True when at least one row is a
+    probable fusion that could not be split safely — callers should route that
+    table to visual review rather than publish a possibly-wrong value.
+    """
+    new_rows: list[list[object]] = []
+    has_ambiguous_or_row = False
+    for row in rows:
+        parts = _split_or_alternative_row(row)
+        if parts is not None:
+            new_rows.extend(parts)
+        else:
+            if any(
+                True
+                for cell in row
+                for _ in _or_alternative_candidates(str(cell))
+            ):
+                has_ambiguous_or_row = True
+            new_rows.append(row)
+    return new_rows, has_ambiguous_or_row
+
+
+# ---------------------------------------------------------------------------
+# Document-independent content-integrity signals for OCR/remote tables.
+#
+# These catch the failures that survive row reconstruction: two monetary values
+# fused with no separator (``130,805,0004,906,000``), a cell that is exactly the
+# same text twice (``Full RangeFull Range``), a label fragment fused on "OR"
+# (``FullORPitch``), and the same parameter label repeated on consecutive rows.
+# They are purely structural — no page number, title, amount or column count is
+# hard-coded — so any document with the same failure pattern is flagged.
+# ---------------------------------------------------------------------------
+_CONCAT_MONEY_RE = re.compile(r"\d{1,3}(?:,\d{3})+\d{1,3}(?:,\d{3})+\b")
+_FUSED_OR_LABEL_RE = re.compile(r"(?<![A-Za-z])(?:[A-Za-z]{4,})OR[A-Za-z]{3,}", re.IGNORECASE)
+
+
+def table_has_content_risk(rows: list[list[object]]) -> bool:
+    """Return True if a table shows structural content that should be reviewed.
+
+    Used as a safety net on top of ``split_merged_or_rows``: tables that contain
+    fused monetary values, doubled cell text, an OR-fused label fragment, or the
+    same label repeated on consecutive rows are routed to visual review so they
+    are not published unchecked.
+    """
+    if not rows:
+        return False
+    previous_label: str | None = None
+    repeated_label = 0
+    for row in rows:
+        if not isinstance(row, list) or not row:
+            previous_label = None
+            continue
+        label = re.sub(r"\s+", " ", str(row[0])).strip()
+        for cell in row:
+            text = str(cell)
+            if _CONCAT_MONEY_RE.search(re.sub(r"\s+", "", text)):
+                return True
+            if _even_repeat(text) and len(re.sub(r"\s+", "", text)) >= 6:
+                return True
+            if re.search(r"\bor\b", text, re.IGNORECASE) and _FUSED_OR_LABEL_RE.search(
+                re.sub(r"\s+", "", text)
+            ):
+                return True
+        if label and previous_label and label == previous_label:
+            repeated_label += 1
+            if repeated_label >= 2:
+                return True
+        else:
+            repeated_label = 0
+        previous_label = label
+    return False
+
+
 def normalize_table_html(table_html: str, *, header_rows: int = 1) -> str:
-    """Repair only the expanded-full-width-header pattern in OCR table HTML."""
+    """Repair bounded OCR markup defects before normalizing table headers."""
+
+    # Some OCR responses concatenate a cell tag and its attributes, for
+    # example ``<tdrowspan=1colspan=1>``.  HTMLParser treats that as an unknown
+    # tag and silently drops the cell.  Only split the known td/th +
+    # rowspan/colspan shape; do not attempt a general HTML rewrite.
+    table_html = re.sub(
+        r"<(t[dh])(?=(?:rowspan|colspan)\s*=)",
+        r"<\1 ",
+        table_html,
+        flags=re.IGNORECASE,
+    )
+    table_html = re.sub(
+        r"(?<=\d)(?=(?:rowspan|colspan)\s*=)",
+        " ",
+        table_html,
+        flags=re.IGNORECASE,
+    )
 
     raw_rows = table_rows_from_html(table_html, collapse_repeated_header=False)
     collapsed_rows = collapse_repeated_full_width_header(raw_rows)
@@ -550,6 +834,14 @@ def table_to_semantic_text(
     if not rectangular:
         return ""
     width = len(rectangular[0])
+    english = bool(re.search(r"[A-Za-z]", " ".join(rectangular[0]))) and not re.search(
+        r"[\u3400-\u9fff]", " ".join(c for row in rectangular for c in row)
+    )
+    # A form's label/value rows have no column header. Do not turn its first
+    # value (e.g. the subject name) into a column label for subsequent rows.
+    if is_label_value_table(rectangular):
+        entries = [f"{row[0].rstrip(':：')}: {row[1]}" for row in rectangular]
+        return "\n".join(([str(title).strip()] if title else []) + entries)
     header_count = min(max(1, header_rows), len(rectangular))
     normalized_title = _normalize_table_cell(title)
     column_labels: list[str] = []
@@ -572,11 +864,15 @@ def table_to_semantic_text(
     if len(rectangular) == header_count:
         fields = [label for label in column_labels if label]
         if fields:
-            lines.append("字段：" + "；".join(fields))
+            lines.append(
+                ("Fields: " if english else "字段：") + ("; " if english else "；").join(fields)
+            )
         else:
             values = [value for value in rectangular[0] if value]
             if values:
-                lines.append("字段：" + "；".join(values))
+                lines.append(
+                    ("Fields: " if english else "字段：") + ("; " if english else "；").join(values)
+                )
         return "\n".join(lines)
 
     record_number = 0
@@ -589,7 +885,9 @@ def table_to_semantic_text(
                 column += 1
                 continue
             if use_labels:
-                label = column_labels[column] or f"第{column + 1}列"
+                label = column_labels[column] or (
+                    f"Column {column + 1}" if english else f"第{column + 1}列"
+                )
                 facts.append(f"{label}={value}")
                 column += 1
                 continue
@@ -604,17 +902,30 @@ def table_to_semantic_text(
                 if end_column == column
                 else f"第{column + 1}-{end_column + 1}列"
             )
+            if english:
+                label = (
+                    f"Column {column + 1}" if end_column == column
+                    else f"Columns {column + 1}-{end_column + 1}"
+                )
             facts.append(f"{label}={value}")
             column = end_column + 1
         if not facts:
             continue
         record_number += 1
-        lines.append(f"记录{record_number}：" + "；".join(facts))
+        lines.append("; ".join(facts) if english else f"记录{record_number}：" + "；".join(facts))
     return "\n".join(lines)
 
 
+def is_label_value_table(rows: list[list[str]]) -> bool:
+    return (
+        len(rows) >= 2 and all(len(row) == 2 and all(row) for row in rows)
+        and len({row[0] for row in rows}) == len(rows)
+        and sum(row[0].endswith((":", "：")) for row in rows) / len(rows) >= .75
+    )
+
+
 TABLE_TITLE_ROW_RE = re.compile(
-    r"^表\s*(?:[A-Za-z]\s*[.\-]?\s*)?(?:\d+(?:[.\-]\d+)*|[一二三四五六七八九十]+)"
+    r"^(?:表\s*|Table\s+)(?:[A-Za-z]{1,8}\s*[.\-]?\s*)?(?:\d+(?:[.\-]\d+)*|[一二三四五六七八九十]+)"
     r"(?:\s*[.、:：\-—])?\s*.*$",
     re.IGNORECASE,
 )
@@ -623,7 +934,7 @@ TABLE_NOTE_ROW_RE = re.compile(
     re.IGNORECASE,
 )
 TABLE_REFERENCE_RE = re.compile(
-    r"^表\s*((?:[A-Za-z]\s*[.\-]?\s*)?(?:\d+(?:[.\-]\d+)*|"
+    r"^(?:表\s*|Table\s+)((?:[A-Za-z]{1,8}\s*[.\-]?\s*)?(?:\d+(?:[.\-]\d+)*|"
     r"[一二三四五六七八九十]+))",
     re.IGNORECASE,
 )
@@ -646,6 +957,84 @@ def _table_reference(title: str) -> str:
     return "表" + raw.replace(".", "")
 
 
+def _bind_trailing_table_captions(pages: list[PageRecord]) -> int:
+    """Move a bottom-of-page caption onto a titleless next-page table.
+
+    Some regulations put ``Table N ...`` on the final line of a page and begin
+    its ruled grid at the top of the following page.  Vector extraction sees
+    those as a paragraph and a separate titleless table, respectively.  Bind
+    only a genuine numbered caption near the preceding page's bottom to the
+    first titleless table near the next page's top; this deliberately avoids
+    treating ordinary nearby prose or a continuation table as a new caption.
+    """
+
+    bound = 0
+    for previous, current in zip(pages, pages[1:], strict=False):
+        previous_blocks = list(previous.rich_blocks)
+        current_blocks = list(current.rich_blocks)
+        if not previous_blocks or not current_blocks:
+            continue
+
+        def top(item: dict[str, Any]) -> float:
+            bbox = item.get("bbox")
+            try:
+                return float(bbox[1])
+            except (IndexError, TypeError, ValueError):
+                return -1.0
+
+        def bottom(item: dict[str, Any]) -> float:
+            bbox = item.get("bbox")
+            try:
+                return float(bbox[3])
+            except (IndexError, TypeError, ValueError):
+                return -1.0
+
+        previous_height = max((bottom(item) for item in previous_blocks), default=0.0)
+        current_height = max((bottom(item) for item in current_blocks), default=0.0)
+        if previous_height <= 0 or current_height <= 0:
+            continue
+        captions = [
+            (index, item)
+            for index, item in enumerate(previous_blocks)
+            if str(item.get("block_type", "")).casefold() == "paragraph"
+            and TABLE_TITLE_ROW_RE.match(str(item.get("text", "")).strip())
+            and top(item) >= previous_height * 0.82
+        ]
+        titleless_tables = [
+            item
+            for item in current_blocks
+            if str(item.get("block_type", "")).casefold() == "table"
+            and not str(item.get("table_title", "")).strip()
+            and 0 <= top(item) <= current_height * 0.25
+        ]
+        if not captions or not titleless_tables:
+            continue
+        caption_index, caption = max(captions, key=lambda candidate: top(candidate[1]))
+        target = min(titleless_tables, key=top)
+        # A caption below an existing table is the only supported shape here;
+        # captions in ordinary prose must remain independent paragraphs.
+        if not any(
+            str(item.get("block_type", "")).casefold() == "table"
+            and bottom(item) < top(caption)
+            for item in previous_blocks
+        ):
+            continue
+        table_title = str(caption.get("text", "")).strip()
+        target["table_title"] = table_title
+        rows = target.get("table_rows")
+        if isinstance(rows, list) and rows:
+            target["text"] = table_to_semantic_text(
+                [[str(cell) for cell in row] for row in rows if isinstance(row, list)],
+                title=table_title,
+                header_rows=max(1, int(target.get("table_header_rows") or 1)),
+            )
+        previous.rich_blocks = [
+            item for index, item in enumerate(previous_blocks) if index != caption_index
+        ]
+        bound += 1
+    return bound
+
+
 def _semantic_table_hints(hints: list[str]) -> list[str]:
     return [
         hint.strip()
@@ -658,7 +1047,12 @@ def _semantic_table_hints(hints: list[str]) -> list[str]:
 
 def _looks_like_table_note(row: list[str]) -> bool:
     """Identify prose inserted between tables, not an in-table ``注：`` row."""
-    text = " ".join(cell for cell in row if cell).strip()
+    cells = [cell.strip() for cell in row if cell.strip()]
+    # A labeled data row with separate values is not a note. Spanning notes
+    # can be repeated by the HTML grid expansion, hence distinct cell count.
+    if len(set(cells)) > 1:
+        return False
+    text = " ".join(cells).strip()
     return len(text) >= 12 and bool(TABLE_NOTE_ROW_RE.match(text))
 
 
@@ -711,11 +1105,33 @@ def _repair_sparse_numeric_columns(rows: list[list[str]]) -> list[list[str]]:
     return repaired
 
 
+def _grouped_table_header_rows(rows: list[list[str]]) -> int:
+    """Recognize a spanning group row followed by distinct leaf labels.
+
+    Require numeric evidence in the following body row, and words in each
+    leaf cell. Repeated body values (e.g. X applicability flags) are not headers.
+    """
+    if len(rows) < 3 or len(rows[0]) < 3:
+        return 1
+    groups, leaves, body = rows[:3]
+    nonempty = [cell for cell in groups if cell]
+    if (
+        not nonempty
+        or len(set(nonempty)) == len(nonempty)
+        or not all(re.search(r"[A-Za-z\u3400-\u9fff]{2,}", cell) for cell in leaves)
+        or len(set(leaves)) != len(leaves)
+        or not any(re.search(r"\d", cell) for cell in body)
+    ):
+        return 1
+    return 2
+
+
 def _split_embedded_tables(
     rows: list[list[str]],
     *,
     title: str,
     page_number: int,
+    allow_single_column: bool = False,
 ) -> tuple[list[tuple[str, list[list[str]], list[int]]], list[str]]:
     """Split several captioned tables accidentally returned as one page grid."""
 
@@ -729,7 +1145,16 @@ def _split_embedded_tables(
         raw_row_count = len(current_rows)
         while len(current_rows) > 2 and _looks_like_table_note(current_rows[-1]):
             notes.insert(0, " ".join(cell for cell in current_rows.pop() if cell))
-        normalized = _repair_sparse_numeric_columns(current_rows)
+        sparse_continuation = bool(
+            len(current_rows) == 1
+            and len(current_rows[0]) >= 2
+            and sum(bool(str(cell).strip()) for cell in current_rows[0]) == 1
+        )
+        normalized = (
+            [list(current_rows[0])]
+            if sparse_continuation
+            else _repair_sparse_numeric_columns(current_rows)
+        )
         if len(normalized) >= 2 and len(normalized[0]) >= 2:
             segments.append(
                 (
@@ -758,6 +1183,22 @@ def _split_embedded_tables(
                     [page_number] * len(normalized),
                 )
             )
+        elif (
+            allow_single_column
+            and len(normalized) >= 2
+            and len(normalized[0]) == 1
+        ):
+            # A wide ruled regulation table may be structurally one column:
+            # dotted leaders and tab stops inside the body do not become
+            # vertical PDF rules. Its geometry was checked by the caller;
+            # preserve it as a table instead of silently falling back to prose.
+            segments.append(
+                (
+                    current_title,
+                    normalized,
+                    [page_number] * len(normalized),
+                )
+            )
         current_rows = []
 
     for row in rows:
@@ -779,6 +1220,24 @@ def _table_title_key(title: str) -> str:
     return re.sub(r"[\s:：,，。;；\-—_]+", "", normalized)
 
 
+def _title_is_header_fragment(title: str, rows: list[list[str]]) -> bool:
+    """Reject captions assembled from one or more column-header cells."""
+
+    if not title or not rows:
+        return False
+    cells = [str(cell).strip() for cell in rows[0] if str(cell).strip()]
+    title_key = _table_title_key(title)
+    if not title_key:
+        return False
+    for start in range(len(cells)):
+        combined = ""
+        for end in range(start, len(cells)):
+            combined += _table_title_key(cells[end])
+            if combined == title_key:
+                return True
+    return False
+
+
 def _row_fingerprint(row: list[str]) -> str:
     return "|".join(
         re.sub(r"[\s:：,，。;；\-—_]+", "", cell).casefold()
@@ -794,6 +1253,33 @@ def _sequence_overlap(previous: list[str], current: list[str]) -> int:
     return 0
 
 
+_NUMBERED_TABLE_ROW_RE = re.compile(
+    r"^\s*(?:section|sec\.?|item)\s+(\d+(?:\.\d+)+)\b",
+    re.IGNORECASE,
+)
+
+
+def _numbered_table_row_id(row: list[str]) -> tuple[int, ...] | None:
+    """Return a regulation row's numeric identifier when one is explicit.
+
+    Federal Register tables often carry no numeric values in the cost/benefit
+    columns.  Their only reliable continuation signal is the ordered section
+    identifier in the first column (for example ``Section 23.729`` followed
+    by ``Section 23.735``).  Keeping this helper narrow prevents ordinary
+    prose rows and column headers from being treated as table continuations.
+    """
+
+    if not row:
+        return None
+    match = _NUMBERED_TABLE_ROW_RE.match(str(row[0]).strip())
+    if not match:
+        return None
+    try:
+        return tuple(int(part) for part in match.group(1).split("."))
+    except ValueError:
+        return None
+
+
 def _rich_block_bbox_key(item: dict[str, Any]) -> tuple[float, float]:
     """Sort rich blocks by (top, left) so table blocks re-inserted by
     merge_cross_page_tables land back in their original reading position
@@ -805,6 +1291,336 @@ def _rich_block_bbox_key(item: dict[str, Any]) -> tuple[float, float]:
         return (float(bbox[1]), float(bbox[0]))
     except (TypeError, ValueError):
         return (float("inf"), float("inf"))
+
+
+# Running header/footer on scanned regulatory pages: a document/docket-ID token
+# ("DRS_88-1", "23-58-DRS_88-1") and a date-time stamp ("26/8/18 10:4"). When a
+# page's table crop includes the running header, the OCR/table extractor turns
+# it into the table title and/or the head of the first data row. These are
+# page furniture, not table content, and must be stripped before the table is
+# canonicalized or merged across pages.
+_PAGE_TIMESTAMP_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\s?\d{1,2}:\d{1,2}\b")
+# A bare all-caps alphanumeric token joined by separators is a doc/docket ID
+# running header, not a descriptive table title (which has words/spaces).
+# A page/document ID needs at least one letter.  The old expression
+# also accepted ordinary two-digit table values ("10" through "99") and thus
+# silently removed an entire first column from numeric continuation tables.
+_PAGE_DOC_ID_HEADER_RE = re.compile(
+    r"^(?=[A-Z0-9_./\\\-]{2,24}$)(?=.*[A-Z])[A-Z0-9][A-Z0-9_./\\\-]{1,24}$"
+)
+
+
+def _strip_page_header_cell(text: str) -> str:
+    """Remove a leading running-header (timestamp + doc-ID) from a cell."""
+    text = _PAGE_TIMESTAMP_RE.sub("", str(text), count=1).strip()
+    # Strip a bare all-caps separators token only when it is a leading token
+    # that precedes real content; catenates with the timestamp above so
+    # "26/8/18 10:4 DRS_88-1 Fuel" -> "Fuel".
+    match = re.match(r"^[A-Z0-9][A-Z0-9_./\\\-]{1,24}(?=\s|$)", text)
+    if match and _PAGE_DOC_ID_HEADER_RE.fullmatch(match[0]):
+        text = text[match.end() :].strip()
+    return text
+
+
+def _strip_table_page_header(
+    title: str,
+    rows: list[list[str]],
+) -> tuple[str, list[list[str]], int]:
+    """Strip page-running-header contamination from a table block.
+
+    Returns ``(title, rows, stripped_rows)`` where ``stripped_rows`` counts
+    leading rows that collapsed to empty after removing the header residue.
+    """
+    header_rows_stripped = 0
+    if title:
+        if _PAGE_TIMESTAMP_RE.search(title):
+            stripped_title = _PAGE_TIMESTAMP_RE.sub("", title).strip()
+            # The timestamp may sit right before a doc-ID token ("26/8/18 10:4
+            # DRS_88-1"): drop the whole header fragment.
+            title = re.sub(r"^[A-Z0-9][A-Z0-9_./\\\-]{1,24}\s*$", "", stripped_title).strip()
+        if _PAGE_DOC_ID_HEADER_RE.fullmatch(title):
+            # A title that is exactly a doc-ID token is the running header.
+            title = ""
+    cleaned_rows: list[list[str]] = []
+    for row in rows:
+        clean_row = list(row)
+        if clean_row:
+            clean_row[0] = _strip_page_header_cell(clean_row[0])
+        if all(str(cell).strip() == "" for cell in clean_row):
+            header_rows_stripped += 1
+            continue
+        cleaned_rows.append(clean_row)
+    return title, cleaned_rows, header_rows_stripped
+
+
+def _detached_table_heading(
+    retained: list[dict[str, Any]],
+    table_bbox: Any,
+) -> str:
+    """Find a short heading immediately preceding a titleless table.
+
+    Vector table detectors do not include ordinary section headings in their
+    caption list.  Preserve a nearby heading such as ``Regulatory Evaluation
+    Summary`` as the table title, while rejecting body paragraphs by requiring
+    heading-like casing and punctuation.
+    """
+
+    try:
+        table_top = float(table_bbox[1])
+    except (IndexError, TypeError, ValueError):
+        return ""
+    for item in reversed(retained[-12:]):
+        if str(item.get("block_type", "")).casefold() != "paragraph":
+            continue
+        text = " ".join(str(item.get("text", "")).split()).strip()
+        regulation_heading = bool(
+            re.match(
+                r"^(?:sec(?:tion)?\.?|§)\s*\d+(?:\.\d+)+\s+\S",
+                text,
+                re.IGNORECASE,
+            )
+        )
+        if (
+            not text
+            or len(text) > 80
+            or (
+                text.endswith((".", ";", "。", "；"))
+                and not regulation_heading
+            )
+        ):
+            continue
+        bbox = item.get("bbox")
+        try:
+            gap = table_top - float(bbox[3])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if gap < -2 or gap > 260:
+            continue
+        words = re.findall(r"[A-Za-z]{3,}", text)
+        title_initials = sum(word[:1].isupper() for word in words)
+        title_case = (
+            2 <= len(words) <= 14
+            and title_initials >= 2
+            and title_initials >= len(words) // 2
+            and text[:1].isupper()
+            and not re.search(r"\b(?:this|the|these|where|which)\b", text, re.IGNORECASE)
+        )
+        cjk_heading = (
+            len(text) <= 40
+            and bool(re.search(r"[\u3400-\u9fff]", text))
+            and "\n" not in text
+        )
+        if regulation_heading or title_case or cjk_heading:
+            return text.rstrip(".")
+    return ""
+
+
+def _preceding_page_table_heading(page: PageRecord, table_bbox: Any) -> str:
+    """Recover a heading when a titleless table starts on the next page.
+
+    Federal Register summaries often introduce a table at the bottom of one
+    page and start the ruled grid at the top of the next.  Reuse the existing
+    heading detector with a synthetic vertical offset, but only for tables in
+    the top quarter of their page so unrelated later tables do not inherit an
+    earlier page's section heading.
+    """
+
+    try:
+        table_top = float(table_bbox[1])
+    except (IndexError, TypeError, ValueError):
+        return ""
+    page_bottom = max(
+        (
+            float(item["bbox"][3])
+            for item in page.rich_blocks
+            if isinstance(item.get("bbox"), (list, tuple))
+            and len(item["bbox"]) >= 4
+        ),
+        default=0.0,
+    )
+    if (page_bottom > 0 and table_top > page_bottom * 0.25) or (
+        page_bottom <= 0 and table_top > 200
+    ):
+        return ""
+    # Put the virtual table just below the preceding page.  The 260-point
+    # search window then examines its final blocks while preserving the same
+    # conservative heading-shape checks as the same-page path.
+    previous_bottom = max(
+        (
+            float(item["bbox"][3])
+            for item in page.rich_blocks
+            if isinstance(item.get("bbox"), (list, tuple))
+            and len(item["bbox"]) >= 4
+        ),
+        default=0.0,
+    )
+    heading = (
+        _detached_table_heading(
+            page.rich_blocks,
+            [0.0, previous_bottom + min(table_top, 40.0), 0.0, 0.0],
+        )
+        if previous_bottom > 0
+        else ""
+    )
+    if heading:
+        return heading
+    # Native PDF text paragraphs do not always carry layout bboxes.  Fall back
+    # to the final raw-text lines and apply the same short, title-case shape
+    # constraints; scanning backwards selects the most local heading.
+    for raw_line in reversed(page.raw_text.splitlines()[-50:]):
+        text = " ".join(raw_line.split()).strip()
+        if not text or len(text) > 80 or text.endswith((".", ";", "。", "；")):
+            continue
+        words = re.findall(r"[A-Za-z]{3,}", text)
+        title_initials = sum(word[:1].isupper() for word in words)
+        if (
+            2 <= len(words) <= 14
+            and title_initials >= 2
+            and title_initials >= len(words) // 2
+            and text[:1].isupper()
+            and not re.search(
+                r"\b(?:this|the|these|where|which)\b",
+                text,
+                re.IGNORECASE,
+            )
+        ):
+            return text
+    return ""
+
+
+def _row_last_terminates(row: list[str]) -> bool:
+    """Whether ``row`` looks like a natural end of a table (a Total/summary)."""
+    return any(
+        re.match(r"^\s*(?:total|小计|合计|总计|共计)\b", str(cell).strip(), re.IGNORECASE)
+        for cell in row
+    )
+
+
+def _is_structural_continuation(
+    previous: dict[str, Any],
+    fragment: dict[str, Any],
+) -> bool:
+    """Fallback cross-page continuation when titles/headers do not literally match.
+
+    A table split across a page boundary without an explicit "续" caption may
+    lose its title/header to the page's running header; match on structure
+    instead: same column count, the previous fragment was cut off mid-data
+    (its last row is not a Total/summary and still carries values), and the
+    next fragment opens with a body row (numeric trailing cells) rather than a
+    fresh column header. This keeps independent titleless tables on consecutive
+    pages from being wrongly merged into one block.
+    """
+    prev_rows = previous.get("rows") or []
+    frag_rows = fragment.get("rows") or []
+    if not prev_rows or not frag_rows:
+        return False
+    prev_last = prev_rows[-1]
+    frag_first = frag_rows[0]
+    if len(prev_last) != len(frag_first):
+        return False
+    # The first page of a cross-page table can contain only its column header.
+    # Treat it as a continuation only when the next page begins with a dense
+    # numeric body row of the exact same width; this avoids merging ordinary
+    # title/header tables with neighbouring prose or a fresh table.
+    if len(prev_rows) == 1 and _fragment_opens_with_column_header(previous):
+        header = prev_rows[0]
+        return (
+            sum(bool(str(cell).strip()) for cell in header) >= 2
+            and not re.match(
+                r"^(?:table|表)\b",
+                str(frag_first[0]).strip(),
+                re.IGNORECASE,
+            )
+            and any(
+                re.search(r"(?:^|[\s:=])[-+±$€£¥]?\d", str(cell))
+                for cell in frag_first
+            )
+        )
+    if _row_last_terminates(prev_last):
+        return False
+    # A regulation summary can legitimately have text-only trailing columns
+    # (``None...`` / ``Editorial``), so the old numeric-cell requirement was
+    # too strict for ordered section tables.  When both fragments expose
+    # increasing section identifiers in the first column, that is strong
+    # evidence of a continuation rather than a fresh header.
+    previous_row_id = _numbered_table_row_id(prev_last)
+    fragment_row_id = _numbered_table_row_id(frag_first)
+    if (
+        previous_row_id is not None
+        and fragment_row_id is not None
+        and fragment_row_id > previous_row_id
+    ):
+        return True
+    # A regulatory-evaluation table may end one part with an Appendix row and
+    # continue on the next page with numbered sections from another CFR part.
+    # The last row alone then loses the ordered-section signal.  Accept the
+    # transition when earlier rows establish that this is a section-summary
+    # table and the next page opens with another numbered Section row.
+    previous_numbered_rows = sum(
+        _numbered_table_row_id(row) is not None for row in prev_rows
+    )
+    if fragment_row_id is not None and previous_numbered_rows >= 2:
+        return True
+    # Previous fragment was cut off mid-data: its last row still carries values.
+    if not any(re.search(r"\d", str(cell)) for cell in prev_last[1:]):
+        # A page break can leave the remainder of one wrapped first-column
+        # cell as the only non-empty cell on the next page.  It has no numeric
+        # payload of its own, but it must still be joined to the prior row.
+        nonempty = [str(cell).strip() for cell in frag_first if str(cell).strip()]
+        previous_row_is_numbered = previous_row_id is not None
+        if len(nonempty) == 1 and previous_row_is_numbered:
+            return True
+        return False
+    # The continuation normally opens with a body row carrying data values.
+    if any(re.search(r"\d", str(cell)) for cell in frag_first[1:]):
+        return True
+    # A page break can cut through one cell. The next page then starts with a
+    # sparse residue such as ["", "system", "", "", ""] before the
+    # remaining body rows. Ordinary fresh column headers are not this sparse.
+    nonempty = [str(cell).strip() for cell in frag_first if str(cell).strip()]
+    return not str(frag_first[0]).strip() and len(nonempty) == 1
+
+
+def _fragment_opens_with_column_header(fragment: dict[str, Any]) -> bool:
+    """Whether the fragment's first row is a column-header (label) row.
+
+    Independent tables in a regulation often share the same column-header
+    template (e.g. "Parameters | Range | …"). A fragment beginning with such a
+    label-only row is a NEW table, not a cross-page continuation, and must not
+    be chained into the previous series by overlap/contained/structure — the
+    header template alone is not evidence that the content continues.
+    """
+    rows = fragment.get("rows") or []
+    if not rows:
+        return False
+    cells = [str(cell).strip() for cell in rows[0] if str(cell).strip()]
+    if len(cells) < 2:
+        return False
+    # A sparse first row with its first cell empty is the common residue of a
+    # vertically wrapped cell that continues on the next page. It is not a
+    # fresh column header, even when the remaining cell is label-like.
+    if not str(rows[0][0]).strip() and len(cells) == 1:
+        return False
+    # Body rows often start with a label and place the value later in the same
+    # cell (e.g. ``Birds: 3-ounce size``). A header detector that only checks
+    # whether a cell *starts* with a digit misclassifies such rows as a new
+    # header and prevents a header-only first page from merging with its body.
+    # Avoid treating footnote suffixes such as ``System1`` as data evidence.
+    if not re.match(r"^(?:table|表)\b", cells[0], re.IGNORECASE) and any(
+        re.search(r"(?:^|[\s:=])[-+±$€£¥]?\d", cell)
+        for cell in cells
+    ):
+        return False
+    # Header labels often carry footnote digits (``Installed System¹`` or
+    # ``Resolution4``), so the mere presence of a digit cannot make the row a
+    # data row.  A genuine column header is label-like across all populated
+    # cells and none of its cells begins with a numeric/sign/currency value.
+    # Body rows such as ``Time | 24 Hrs | ±0.125% | 0.25 | 1 sec`` therefore
+    # remain continuations, while ``Parameters | Range | Installed System1``
+    # correctly opens a new independent table.
+    return all(re.search(r"[A-Za-z\u3400-\u9fff]", cell) for cell in cells) and not any(
+        re.match(r"^[\s]*[$€£¥±+\-]?\d", cell) for cell in cells
+    )
 
 
 def merge_cross_page_tables(
@@ -822,6 +1638,7 @@ def merge_cross_page_tables(
     must not fail the caption-alignment gate.
     """
 
+    trailing_caption_bindings = _bind_trailing_table_captions(pages)
     pages_by_number = {page.page_number: page for page in pages}
     fragments: list[dict[str, Any]] = []
     invalid_pages: set[int] = set()
@@ -843,7 +1660,7 @@ def merge_cross_page_tables(
     actual_caption_refs: dict[int, set[str]] = {
         page.page_number: set() for page in pages
     }
-    for page in pages:
+    for page_index, page in enumerate(pages):
         retained: list[dict[str, Any]] = []
         hint_titles = _semantic_table_hints(page.table_hints)
         used_hint_refs: set[str] = set()
@@ -881,10 +1698,18 @@ def merge_cross_page_tables(
                     if isinstance(row, list)
                 ]
             )
+            # General (document-agnostic) reconstruction of rows that the source
+            # model flattened from two "OR"-alternative sub-rows (e.g. FAA
+            # recorder-spec tables).  Unambiguous fusions are split into two
+            # logical rows; ambiguous fusions are left intact but routed to the
+            # merged-cell visual-review set so they are not published unchecked.
+            rows, has_ambiguous_or_row = split_merged_or_rows(rows)
+            if has_ambiguous_or_row or table_has_content_risk(rows):
+                merged_cell_review_pages.add(page.page_number)
             header_only_form = (
                 len(rows) == 1
                 and len(rows[0]) >= 2
-                and raw_row_count >= 2
+                and (raw_row_count >= 2 or item.get("table_header_only") is True)
             )
             # A single-row multi-column header is a real table too (e.g. the
             # "数据包格式" schematic in GB 46750-2025: 1 row x 8 columns of
@@ -896,13 +1721,36 @@ def merge_cross_page_tables(
                 and len(rows[0]) >= 4
                 and all(str(cell).strip() for cell in rows[0])
             )
+            bbox = item.get("bbox")
+            try:
+                table_width = float(bbox[2]) - float(bbox[0])
+                table_height = float(bbox[3]) - float(bbox[1])
+            except (IndexError, TypeError, ValueError):
+                table_width = 0.0
+                table_height = 0.0
+            # Keep the canonicalizer consistent with vector preflight: a
+            # substantial ruled, single-column regulation table is still a
+            # table even when dotted leaders or tab stops do not yield a
+            # vertical PDF rule. Requiring a wide/tall frame and a rich body
+            # cell keeps short appendix headings and decorative frames out.
+            single_column_structured = (
+                len(rows) >= 2
+                and len(rows[0]) == 1
+                and sum(bool(str(cell).strip()) for row in rows for cell in row) >= 2
+                and table_width >= 300
+                and table_height >= 80
+                and max((len(str(cell).strip()) for row in rows for cell in row), default=0)
+                >= 24
+            )
             if (len(rows) < 2 and not header_only_form and not single_row_schematic) or (
-                rows and len(rows[0]) < 2
+                rows and len(rows[0]) < 2 and not single_column_structured
             ):
                 invalid_pages.add(page.page_number)
                 retained.append(item)
                 continue
             title = str(item.get("table_title") or item.get("caption") or "").strip()
+            if _title_is_header_fragment(title, rows):
+                title = ""
             explicit_reference = _table_reference(title)
             if explicit_reference:
                 used_hint_refs.add(explicit_reference)
@@ -938,6 +1786,20 @@ def merge_cross_page_tables(
                 re.IGNORECASE,
             ):
                 merged_cell_review_pages.add(page.page_number)
+            # Strip the running page header (doc-ID / date-time stamp) that the
+            # OCR/table extractor captured as the table title and/or the head
+            # of the first data row, so the block holds only real content and
+            # cross-page fragments can be matched on structure.
+            title, rows, stripped_header_rows = _strip_table_page_header(title, rows)
+            if not title:
+                title = _detached_table_heading(retained, item.get("bbox"))
+            if not title and page_index > 0:
+                title = _preceding_page_table_heading(
+                    pages[page_index - 1],
+                    item.get("bbox"),
+                )
+            if stripped_header_rows:
+                merged_cell_review_pages.add(page.page_number)
             asset_ids = [
                 str(value)
                 for value in item.get("asset_ids", [])
@@ -950,6 +1812,7 @@ def merge_cross_page_tables(
                 rows,
                 title=title,
                 page_number=page.page_number,
+                allow_single_column=single_column_structured,
             )
             if not segments:
                 invalid_pages.add(page.page_number)
@@ -980,14 +1843,16 @@ def merge_cross_page_tables(
                     "header_rows": max(
                         1,
                         int(item.get("table_header_rows") or 1),
+                        _grouped_table_header_rows(segment_rows),
                     ),
                     "asset_ids": list(dict.fromkeys(asset_ids)),
                     "bbox": item.get("bbox"),
+                    "last_bbox": item.get("bbox"),
                     "ordinal": ordinal,
                     "merged_cell_count": merged_cell_count,
                     "table_html": (
                         source_table_html
-                        if len(segments) == 1
+                        if len(segments) == 1 and segment_rows == rows
                         else ""
                     ),
                 }
@@ -1009,6 +1874,8 @@ def merge_cross_page_tables(
         previous = series[-1] if series else None
         merge = False
         overlap = 0
+        contained = False
+        contained_at: int | None = None
         if previous is not None and fragment["page_start"] == previous["page_end"] + 1:
             previous_fingerprints = [
                 _row_fingerprint(row) for row in previous["rows"]
@@ -1028,8 +1895,8 @@ def merge_cross_page_tables(
             common_prefix = 0
             if same_header:
                 for old_row, new_row in zip(
-                    previous_fingerprints[:6],
-                    current_fingerprints[:6],
+                    previous_fingerprints[: int(previous["header_rows"])],
+                    current_fingerprints[: int(fragment["header_rows"])],
                     strict=False,
                 ):
                     if old_row != new_row:
@@ -1038,26 +1905,37 @@ def merge_cross_page_tables(
             header_offset = common_prefix
             current_data = current_fingerprints[header_offset:]
             overlap = _sequence_overlap(previous_fingerprints, current_data)
-            contained = bool(current_data) and any(
-                previous_fingerprints[index : index + len(current_data)]
-                == current_data
-                for index in range(
-                    max(0, len(previous_fingerprints) - len(current_data) + 1)
-                )
+            contained_at = next(
+                (
+                    index
+                    for index in range(
+                        max(0, len(previous_fingerprints) - len(current_data) + 1)
+                    )
+                    if current_data
+                    and previous_fingerprints[index : index + len(current_data)]
+                    == current_data
+                ),
+                None,
             )
+            contained = contained_at is not None
+            # A fragment that opens with a column-header row is a new table, so
+            # overlap/contained/structure must not chain it to the previous
+            # series (independent tables can share the same header template).
+            # This applies whether or not the fragment carries a title — a
+            # same-title / "续" continuation is still merged above, and a
+            # fresh header is a stronger signal of a new table than a title.
+            opens_new_table = _fragment_opens_with_column_header(fragment)
             merge = same_width and (
                 same_title
                 or continuation
                 or (
-                    same_header
+                    not opens_new_table
                     and (
-                        not previous["title_key"]
-                        or not fragment["title_key"]
+                        overlap > 0
+                        or contained
+                        or _is_structural_continuation(previous, fragment)
                     )
                 )
-                or overlap > 0
-                or contained
-                or (not fragment["title_key"] and not previous["title_key"])
             )
             if contained:
                 overlap = len(current_data)
@@ -1069,7 +1947,7 @@ def merge_cross_page_tables(
             # the form is published as a single chunk instead of fragments.
             # The narrower region is right-padded to the wider grid's width so
             # the combined rows stay rectangular for Markdown/HTML rendering.
-            previous_bbox = previous.get("bbox")
+            previous_bbox = previous.get("last_bbox") or previous.get("bbox")
             fragment_bbox = fragment.get("bbox")
             adjacent = bool(
                 previous_bbox
@@ -1083,7 +1961,55 @@ def merge_cross_page_tables(
             same_blank_title = bool(
                 not fragment["title_key"] and not previous["title_key"]
             )
-            merge = adjacent and same_blank_title
+            # A cross-page series may already have inherited a title from its
+            # first page. A titleless grid immediately below the final
+            # continuation row on that same page is still part of the series;
+            # require an actually multi-page predecessor so independent titled
+            # tables on one page remain separate.
+            titleless_series_tail = bool(
+                not fragment["title_key"]
+                and previous["page_end"] > previous["page_start"]
+            )
+            prev_rows_0 = previous.get("rows") or []
+            frag_rows_0 = fragment.get("rows") or []
+            same_width = bool(
+                prev_rows_0
+                and frag_rows_0
+                and len(prev_rows_0[0]) == len(frag_rows_0[0])
+            )
+            # Caption recovery can mistake the preceding, page-spanning row
+            # label for the title of a detached final grid. Accept it only
+            # when it is a prefix of that row and the next numbered data row
+            # advances within an already established cross-page series.
+            previous_row_id = (
+                _numbered_table_row_id(prev_rows_0[-1]) if prev_rows_0 else None
+            )
+            next_row_id = (
+                _numbered_table_row_id(frag_rows_0[0]) if frag_rows_0 else None
+            )
+            row_label_as_title = bool(
+                same_width
+                and previous["page_end"] > previous["page_start"]
+                and fragment["title_key"]
+                and previous_row_id is not None
+                and next_row_id is not None
+                and next_row_id > previous_row_id
+                and _table_title_key(str(prev_rows_0[-1][0])).startswith(
+                    fragment["title_key"]
+                )
+            )
+            opens_new_table = _fragment_opens_with_column_header(fragment)
+            # A same-page table that starts with a fresh column-header row and
+            # has the same width as the previous table is a *new* independent
+            # table (e.g. Appendix E beginning directly below the tail of
+            # Appendix D on the same page), not a continuation of the same blank
+            # record form.  Only different-width blank-title blocks (a form's
+            # field block + data grid) are still merged.
+            merge = adjacent and (
+                same_blank_title or titleless_series_tail or row_label_as_title
+            ) and not (
+                same_width and opens_new_table
+            )
             if merge:
                 overlap = 0
                 header_offset = 0
@@ -1098,16 +2024,48 @@ def merge_cross_page_tables(
             previous.get("merged_cell_count") or 0
         ) + int(fragment.get("merged_cell_count") or 0)
         previous["table_html"] = ""
+        previous["last_bbox"] = fragment.get("bbox")
         if not previous["title"] and fragment["title"]:
             previous["title"] = fragment["title"]
             previous["title_key"] = fragment["title_key"]
         repeated_header_rows = header_offset
+        sparse_cells = [
+            (index, str(cell).strip())
+            for index, cell in enumerate(fragment["rows"][0])
+            if str(cell).strip()
+        ] if fragment["rows"] else []
+        sparse_residue = len(sparse_cells) == 1 and bool(previous["rows"])
+        if sparse_residue and previous["rows"]:
+            residue_row = fragment["rows"][0]
+            residue_column = sparse_cells[0][0]
+            previous_cell = str(previous["rows"][-1][residue_column]).rstrip()
+            residue = str(residue_row[residue_column]).strip()
+            previous["rows"][-1][residue_column] = f"{previous_cell} {residue}".strip()
+            if previous["row_pages"]:
+                # The logical row starts on the prior page but its text is
+                # completed by this sparse continuation fragment. Attribute it
+                # to the continuation page so page-level citations do not
+                # point only at the truncated first half.
+                previous["row_pages"][-1] = fragment["page_start"]
+            repeated_header_rows = max(repeated_header_rows, 1)
         previous["header_rows"] = max(
             int(previous["header_rows"]),
             repeated_header_rows,
         )
         start = repeated_header_rows + overlap
         duplicate_rows_removed += start
+        if contained and contained_at is not None:
+            # Keep one copy of duplicated continuation rows, but transfer their
+            # provenance to the later page fragment. Otherwise page-scoped
+            # display/cleaning falsely attributes the continuation to the
+            # preceding page.
+            source_pages = fragment["row_pages"][
+                repeated_header_rows : repeated_header_rows + len(current_data)
+            ]
+            for offset, source_page in enumerate(source_pages):
+                target = contained_at + offset
+                if target < len(previous["row_pages"]):
+                    previous["row_pages"][target] = source_page
         previous["rows"].extend(fragment["rows"][start:])
         previous["row_pages"].extend(fragment["row_pages"][start:])
         # Same-page merges join regions of different widths (e.g. a 2-column
@@ -1218,6 +2176,7 @@ def merge_cross_page_tables(
         "table_caption_mismatch_pages": caption_mismatch_pages,
         "duplicate_table_id_pages": sorted(duplicate_table_id_pages),
         "merged_cell_review_pages": sorted(merged_cell_review_pages),
+        "trailing_table_caption_bindings": trailing_caption_bindings,
     }
 
 
@@ -1411,6 +2370,18 @@ def is_glyph_name_garbage(text: str) -> bool:
     total = len(compact)
     if total < 20:
         return False
+
+    # Some PDF fonts expose decimal glyph names (/0/1/2.../i255),
+    # rather than /Gxx. Require long dense runs and many distinct names so
+    # dates, paths, fractions and ordinary slash-separated values stay native.
+    numeric_runs = re.findall(r"(?:/(?:i?\d{1,5})(?=/|$)){12,}", compact)
+    numeric_names = re.findall(r"/(i?\d+)", "".join(numeric_runs))
+    if (
+        len(numeric_names) >= 40
+        and sum(map(len, numeric_runs)) / total > 0.5
+        and len(set(numeric_names)) >= 10
+    ):
+        return True
 
     glyph_matches = list(GLYPH_NAME_RE.finditer(compact))
     if not glyph_matches:
@@ -1639,6 +2610,26 @@ def has_low_quality_ocr_text(
 WATERMARK_IMAGE_MAX_EDGE = 400
 
 
+def has_outlined_text(pdf_page: Any, raw_text: str) -> bool:
+    """Route dense painted glyph outlines without extractable text to OCR.
+
+    Print-to-PDF can replace fonts with thousands of filled Bezier paths.
+    Such pages need recognition even though they contain no raster scan.
+    Small vector diagrams do not meet this conservative density threshold.
+    """
+    if compact_chars(raw_text):
+        return False
+    try:
+        stream = pdf_page.get_contents()
+        counts = Counter(op for _, op in stream.operations) if stream is not None else Counter()
+        return (
+            sum(counts[op] for op in (b"c", b"v", b"y")) >= 500
+            and sum(counts[op] for op in (b"f", b"f*", b"B", b"B*")) >= 100
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def is_watermark_only_page(pdf_page: Any, raw_text: str) -> bool:
     """Detect pages that contain only a small watermark image and no real text.
 
@@ -1649,6 +2640,19 @@ def is_watermark_only_page(pdf_page: Any, raw_text: str) -> bool:
     """
 
     if compact_chars(raw_text):
+        return False
+    # A small raster table/formula does not make the surrounding vector
+    # content a watermark. Keep any page with painted paths for parsing.
+    try:
+        stream = pdf_page.get_contents()
+        if stream is not None and any(
+            op in {b"S", b"s", b"f", b"f*", b"B", b"B*", b"b", b"b*"}
+            for _, op in stream.operations
+        ):
+            return False
+    except AttributeError:
+        pass
+    except (TypeError, ValueError):
         return False
     resources = pdf_page.get("/Resources", {})
     xobjects = resources.get("/XObject", {})
@@ -1817,7 +2821,140 @@ def filter_repeated_margin_rich_blocks(
     return removed
 
 
+# Federal Register running header as read by the vector (pdfplumber) parser.
+# The native layer reads it as "<page no> Federal Register / Vol. V, No. N / ...",
+# but the 3-column vector layer moves the page number to the end and drops the
+# spaces around the field separators:
+#   Federal Register/Vol. 74, No. 157/Monday, August 17, 2009/Proposed Rules 41525
+#   (some pages keep the leading page number: "41536 Federal Register/Vol. …")
+FEDERAL_REGISTER_RICH_HEADER_RE = re.compile(
+    r"^(?:\d{5}\s+)?Federal Register\s*/?\s*Vol\.\s*\d+\s*,\s*No\.\s*\d+\s*/\s*"
+    r"[A-Z][a-z]+day,\s*[A-Z][a-z]+ \d{1,2},\s*\d{4}\s*/\s*"
+    r"[A-Z][A-Za-z ]+(?:\s*\d{5})?\s*$"
+)
+
+
+def filter_federal_register_rich_blocks(page: PageRecord) -> int:
+    """Remove Federal Register (GPO) running header/footer from vector blocks.
+
+    Vector/figure pages carry their content as pdfplumber word blocks, so the
+    GPO running header and the production-footer stamp survive as isolated
+    paragraph blocks that ``clean_page`` (which operates on ``page.raw_text``)
+    cannot reach. The footer is also read bottom-up as tiny reversed fragments
+    (``no``, ``nosnibors``, ``2SLASOPORP``, ``DORP1B6LCWHKSD``, ``>HPG/<…``)
+    that end up merged into published chunks as junk.
+
+    Remove everything that matches the distinctive FR tokens (running header,
+    production stamp, ``<GPH>`` figure placeholder). Because the fragments are
+    read in reverse and cannot be reliably matched by content, a page already
+    known to be a Federal Register page also drops short, CJK-free paragraph
+    fragments sitting in the bottom margin band — the footer never carries
+    meaningful multi-word prose, while the few long lines that legitimately
+    reach the bottom of a page are preserved.
+    """
+    if not page.rich_blocks:
+        return 0
+    page_height = 842.0
+    # The GPO footer and pdfplumber's reversed operator-tail fragments sit in
+    # the bottom band. 0.865 (≈729pt) catches the >HPG/… fragments at y≈732;
+    # the few long lines that legitimately reach this band are protected by the
+    # short-length guard below.
+    bottom_margin_max = page_height * 0.865
+    items = list(page.rich_blocks)
+
+    def _is_fr_header(item: dict[str, Any]) -> bool:
+        text = str(item.get("text", "")).strip()
+        if not text:
+            return False
+        return bool(
+            FEDERAL_REGISTER_RICH_HEADER_RE.fullmatch(text)
+            or normalized_margin_key(text).startswith("federalregister/vol")
+        )
+
+    def _is_fr_stamp(item: dict[str, Any]) -> bool:
+        text = str(item.get("text", "")).strip()
+        if not text:
+            return False
+        return bool(
+            FEDERAL_REGISTER_STAMP_RE.search(text)
+            or "SGM" in text
+            or FEDERAL_REGISTER_GPH_LINE_RE.fullmatch(text)
+        )
+
+    is_fr_page = any(_is_fr_header(item) or _is_fr_stamp(item) for item in items)
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for item in items:
+        text = str(item.get("text", "")).strip()
+        block_type = str(item.get("block_type", "")).casefold()
+        if _is_fr_header(item) or _is_fr_stamp(item):
+            removed += 1
+            continue
+        bbox = item.get("bbox")
+        y_top = (
+            float(bbox[1])
+            if isinstance(bbox, (list, tuple)) and len(bbox) >= 2
+            else None
+        )
+        if (
+            is_fr_page
+            and block_type == "paragraph"
+            and text
+            and y_top is not None
+            and y_top >= bottom_margin_max
+            and len(text) <= 24
+            and not re.search(r"[\u3400-\u9fff]", text)
+        ):
+            # Bottom-margin fragment of the reversed FR footer.
+            removed += 1
+            continue
+        kept.append(item)
+    page.rich_blocks = kept
+    return removed
+
+
 def heading_kind(text: str) -> str | None:
+    if re.fullmatch(
+        r"Appendix\s+[A-Z0-9]+\s+(?:to\s+Part\s+\d+\s*)?[—–-].{1,160}",
+        normalize_line(text), re.I,
+    ):
+        return "annex"
+    if re.fullmatch(
+        r"(?:PART\s+\d+|Subpart\s+[A-Z])\s*[—–-].{1,160}", normalize_line(text), re.I,
+    ):
+        return "chapter"
+    # A wrapped body sentence can start with a bare section identifier, e.g.
+    # ``23.1587 as proposed ... Because ...``.  It is a reference in prose,
+    # not a heading; reject it before the broad numbered-clause patterns.
+    if re.match(
+        r"^\s*\d+(?:\.\d+)+\s+(?:as|is|are|was|were|would|should|because|the)\b",
+        normalize_line(text),
+        re.IGNORECASE,
+    ):
+        return None
+    # Federal-Register *preamble* discussion paragraphs often open with a
+    # sentence that names a section and then continues with a verb, e.g.
+    # ``Section 23.571(d) still requires the damage tolerance option under
+    # Sec. 23.573 ...`` or ``Section 23.1309(d) also specifies that the design
+    # of systems and controls ...``.  These are prose that merely *cites* a
+    # section; they are NOT amendatory/section headings. Treating them as
+    # ``clause`` used to swallow tens of preamble paragraphs under one
+    # sentence-fragment section title and attach a spurious article id
+    # (23.571(D)/23.1309(D)), so those discussion chunks were indexed as if
+    # they were the regulation requirement. Only a short title after the
+    # reference ("Sec. 23.856 Thermal/acoustic insulation materials.") is a
+    # real heading.
+    ref_prose = re.match(
+        r"^\s*(?:Sec(?:tion)?\.?\s+|Section\s+|Sec\s+)\d+(?:\.\d+)*[A-Z]?"
+        r"(?:\([A-Z0-9]+\))*\s+"
+        r"(?:still|also|does|do|may|will|shall|is|are|was|were|would|should|"
+        r"requires?|specifies|cannot|must|applies?|provides?|states|covers|"
+        r"it|we|the|as)\b",
+        normalize_line(text),
+        re.IGNORECASE,
+    )
+    if ref_prose:
+        return None
     for kind, pattern in HEADING_PATTERNS:
         if pattern.search(text):
             if kind == "annex" and _looks_like_annex_prose(text):
@@ -2088,8 +3225,10 @@ def detect_repeated_margin_lines(pages: list[PageRecord]) -> set[str]:
 
 def clean_page(page: PageRecord, repeated_margin_keys: set[str]) -> tuple[str, int]:
     kept: list[str] = []
+    footnotes: list[str] = []
     removed = 0
     raw_lines = [line for line in page.raw_text.splitlines() if line.strip()]
+    seen_fr_footer = False
     for index, raw_line in enumerate(raw_lines):
         line = normalize_line(raw_line)
         # Damaged-font fake glyphs (犌犅 → GB, 附录犃 → 附录A) survive into the
@@ -2098,6 +3237,31 @@ def clean_page(page: PageRecord, repeated_margin_keys: set[str]) -> tuple[str, i
         line = repair_fake_glyphs(line)
         key = normalized_margin_key(line)
         is_margin = index < 3 or index >= max(0, len(raw_lines) - 3)
+        # Federal Register (GPO) running header sits in the top margin band.
+        if is_margin and FEDERAL_REGISTER_HEADER_RE.fullmatch(line):
+            removed += 1
+            continue
+        # Federal Register (GPO) production footer. Cut the print-run stamp
+        # (and anything after it) off the line, keeping any body text that
+        # precedes it; then drop the figure-placeholder / operator-tail lines
+        # that follow the stamp on figure pages.
+        stamp = FEDERAL_REGISTER_STAMP_RE.search(line)
+        if stamp:
+            line = line[: stamp.start()].rstrip()
+            seen_fr_footer = True
+            if not line:
+                removed += 1
+                continue
+        if FEDERAL_REGISTER_GPH_LINE_RE.fullmatch(line) or (
+            seen_fr_footer and FEDERAL_REGISTER_OPERATOR_TAIL_RE.fullmatch(line)
+        ):
+            removed += 1
+            continue
+        # Federal Register bottom footnote (pulled to the page top by pypdf).
+        # Relocate it to the end of the page instead of gluing it to the body.
+        if FEDERAL_REGISTER_FOOTNOTE_RE.match(line):
+            footnotes.append(line)
+            continue
         if PAGE_NUMBER_RE.fullmatch(line):
             removed += 1
             continue
@@ -2130,6 +3294,18 @@ def clean_page(page: PageRecord, repeated_margin_keys: set[str]) -> tuple[str, i
     annex_title_pending = False
     for line in kept:
         kind = heading_kind(line)
+        semantic_table_line = bool(
+            re.match(r"^(?:Columns?\s+\d+(?:-\d+)?|Parameters)=", line)
+            or line.count("=") >= 2
+        )
+        if semantic_table_line:
+            # table_to_semantic_text emits one field/value record per line.
+            # Preserve those row boundaries in cleaned.md instead of joining a
+            # whole multi-page table into one unreadable paragraph.
+            flush()
+            paragraphs.append(line)
+            annex_title_pending = False
+            continue
         if kind or TABLE_TITLE_RE.match(line):
             flush()
             paragraphs.append(line)
@@ -2178,6 +3354,10 @@ def clean_page(page: PageRecord, repeated_margin_keys: set[str]) -> tuple[str, i
         if re.search(r"[。！？；;:]$", line):
             flush()
     flush()
+    # Relocate the bottom-of-page footnotes to the end of the page so the body
+    # starts with the real text; each keeps its citation on its own line.
+    if footnotes:
+        paragraphs.extend(footnotes)
     return "\n".join(paragraphs), removed
 
 
@@ -2185,10 +3365,16 @@ def split_blocks(
     document_id: str,
     pages: list[PageRecord],
 ) -> list[BlockRecord]:
+    # Vector blocks can be added after the earlier table-canonicalization pass
+    # (for example while a hybrid parser merges a selected page). Re-apply this
+    # idempotent binding at the final block boundary so a caption printed at
+    # the bottom of page N still travels with its table at the top of page N+1.
+    _bind_trailing_table_captions(pages)
     blocks: list[BlockRecord] = []
     chapter: str | None = None
     annex: str | None = None
     article_reference = None
+    active_article_levels: list[str] = []
     # Clause number hierarchy (e.g. "4 一般要求" -> ["4 一般要求"],
     # then "4.1 功能" -> ["4 一般要求", "4.1 功能"], then
     # "4.8.1 低气压" -> ["4 一般要求", "4.8 环境适应性", "4.8.1 低气压"]).
@@ -2371,14 +3557,21 @@ def split_blocks(
                     ),
                 )
             )
+        page_parts = expand_regulatory_blocks(page_parts)
         for local_index, item in enumerate(page_parts):
             text = str(item.get("text", "")).strip()
             if not text:
                 continue
-            kind = heading_kind(text)
+            item_block_type = str(item.get("block_type") or "").casefold()
+            # A structured table's semantic text begins with its title.  It is
+            # content, not a new heading event: re-running heading detection on
+            # it would reset an active paragraph such as 33.77(E) back to the
+            # bare section 33.77 immediately before metadata is assigned.
+            kind = None if item_block_type == "table" else heading_kind(text)
             if kind == "chapter":
                 chapter, annex = text, None
                 article_reference = None
+                active_article_levels = []
                 clause_stack = []
                 pending_unnumbered = []
                 unnumbered_parent_stack = []
@@ -2410,9 +3603,12 @@ def split_blocks(
                 # deeper sub-heading can restore the correct parent.
                 unnumbered_parent_stack = clause_stack[:-1] + [text]
                 article_reference = match_article_heading(text)
+                if article_reference is not None:
+                    active_article_levels = list(article_reference.levels)
             elif kind == "annex":
                 annex, chapter = text, None
                 article_reference = None
+                active_article_levels = []
                 clause_stack = []
                 pending_unnumbered = []
                 unnumbered_parent_stack = []
@@ -2519,6 +3715,34 @@ def split_blocks(
                     kind = "clause"
                     article_reference = match_article_heading(text)
 
+            # Federal regulations commonly put paragraph markers on their own
+            # line below a ``Sec. N.N`` heading.  Track that local hierarchy so
+            # a following table receives 33.77(E), not an unrelated article
+            # reference carried from earlier prose.  Alphabetic markers start
+            # a sibling paragraph; numeric markers nest beneath the active
+            # alphabetic paragraph. Compound markers such as ``(a)(2)`` are
+            # handled in one pass.
+            marker_match = re.match(
+                r"^\s*((?:\([A-Za-z0-9]+\))+)(?=\s|\S)",
+                text,
+            )
+            if marker_match and article_reference is not None:
+                marker_tokens = re.findall(r"\(([A-Za-z0-9]+)\)", marker_match.group(1))
+                for marker in marker_tokens:
+                    if marker.isalpha():
+                        active_article_levels = [marker]
+                    elif active_article_levels and active_article_levels[0].isalpha():
+                        active_article_levels = [active_article_levels[0], marker]
+                    else:
+                        active_article_levels = [marker]
+                contextual = match_article_heading(
+                    article_reference.base_id
+                    + "".join(f"({level})" for level in active_article_levels)
+                    + " context"
+                )
+                if contextual is not None:
+                    article_reference = contextual
+
             section_path = [
                 value
                 for value in (annex, chapter, *clause_stack)
@@ -2529,6 +3753,21 @@ def split_blocks(
                 or kind
                 or ("table_hint" if TABLE_TITLE_RE.match(text) else "paragraph")
             )
+            table_title = str(item.get("table_title") or "").strip()
+            if block_type.casefold() == "table" and table_title:
+                # The canonical table title is stronger context than a stale
+                # numbered prose heading carried across pages.  Keeping only
+                # the title prevents unrelated discussion sections from being
+                # published as table retrieval metadata.
+                section_path = [table_title]
+                table_reference = match_article_heading(table_title)
+                if table_reference is not None:
+                    if (
+                        article_reference is None
+                        or article_reference.base_id != table_reference.base_id
+                    ):
+                        article_reference = table_reference
+                        active_article_levels = list(table_reference.levels)
             block_id = stable_id(document_id, page.page_number, local_index, text)
             blocks.append(
                 BlockRecord(
@@ -2665,7 +3904,19 @@ def split_structured_table_block(
             [block.source_page_start or block.page_number]
             * (len(rows) - len(row_pages))
         )
-    if len(block.text) <= limit:
+    # A complete, one-page regulation table is a single logical unit.  Keeping
+    # a moderately long one intact prevents retrieval from separating a row
+    # from its later continuation rows (for example, ``plus 3`` / ``plus 4``).
+    # Very large tables and every cross-page table still use row-boundary
+    # splitting with repeated headers.
+    single_page_table_limit = max(limit, 2400)
+    is_single_page_table = (
+        (block.source_page_start or block.page_number)
+        == (block.source_page_end or block.page_number)
+    )
+    if len(block.text) <= limit or (
+        is_single_page_table and len(block.text) <= single_page_table_limit
+    ):
         yield replace(
             block,
             table_rows=rows,
@@ -2798,6 +4049,16 @@ def chunk_from_blocks(
             context[-1]
         ):
             body = "\n".join(block.text for block in blocks[1:])
+        else:
+            # Structured table text commonly starts with its table_title,
+            # while the same value is also the canonical section context.
+            # Remove only leading whole lines that exactly repeat context;
+            # field labels inside table records must remain untouched.
+            body_lines = body.splitlines()
+            normalized_context = {normalize_line(value) for value in context}
+            while body_lines and normalize_line(body_lines[0]) in normalized_context:
+                body_lines.pop(0)
+            body = "\n".join(body_lines)
     text = (
         "\n".join(context)
         if body_is_last_context
@@ -3249,6 +4510,7 @@ def parse_pdf(path: Path) -> ParsedDocument:
         layout_features = extract_page_layout_features(pdf_page, raw_text)
         tounicode_cid_conflict = has_tounicode_cid_conflict(pdf_page)
         glyph_name_garbage = is_glyph_name_garbage(raw_text)
+        outlined_text = has_outlined_text(pdf_page, raw_text)
         low_quality_ocr = has_low_quality_ocr_text(
             raw_text,
             image_ratio=float(layout_features.get("image_ratio", 0.0)),
@@ -3281,6 +4543,7 @@ def parse_pdf(path: Path) -> ParsedDocument:
                 raw_char_count=compact_count,
                 invalid_unicode_count=invalid_unicode_count,
                 text_layer_corruption={
+                    "outlined_text": outlined_text,
                     "glyph_name_garbage": glyph_name_garbage,
                     "tounicode_cid_conflict": tounicode_cid_conflict,
                     "low_quality_ocr": low_quality_ocr,

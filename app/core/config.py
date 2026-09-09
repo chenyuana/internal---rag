@@ -7,10 +7,18 @@ from typing import Any, Literal
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::-([^}]*))?\}")
+
+
+def _is_local_url(value: str) -> bool:
+    """True when a model base_url points at a loopback host (local inference)."""
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(value).hostname or "").lower()
+    return host in {"localhost", "127.0.0.1", "::1"}
 
 
 class AppSettings(BaseModel):
@@ -68,6 +76,29 @@ class FigureVisionSettings(BaseModel):
     max_output_tokens: int = Field(default=800, ge=128, le=4096)
 
 
+class LlmStructureSettings(BaseModel):
+    """Optional LLM-driven re-annotation of chunk structure metadata.
+
+    ``split_blocks/build_chunks`` heuristically classify headings; for Federal
+    Register amendment documents this mis-binds appendix content to the
+    amended section and treats preamble ``Section 23.NNN <verb>...`` reference
+    prose as clause headings. When enabled, this runs an OpenAI-compatible chat
+    model over each batch of pages and rewrites ``section_path / article_id_* /
+    title / article_aliases / keywords`` from reading-order boundary events.
+    Body text is never rewritten. Any error falls back to the heuristic result.
+    """
+
+    enabled: bool = False
+    base_url: str = "https://api.deepseek.com/v1"
+    model: str = "deepseek-v4-flash"
+    api_key: SecretStr = Field(default=SecretStr(""))
+    timeout_seconds: float = Field(default=180, gt=0)
+    page_batch_size: int = Field(default=3, ge=1, le=50)
+    max_tokens: int = Field(default=2048, ge=128, le=8192)
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+
+
+
 class IngestionSettings(BaseModel):
     enabled: bool = True
     root_dir: Path = Path("D:/internal-rag/data/ingestion")
@@ -85,6 +116,7 @@ class IngestionSettings(BaseModel):
         )
     )
     figure_vlm: FigureVisionSettings = Field(default_factory=FigureVisionSettings)
+    llm_structure: LlmStructureSettings = Field(default_factory=LlmStructureSettings)
 
 
 class AccessControlSettings(BaseModel):
@@ -98,6 +130,7 @@ class ModelEndpointSettings(BaseModel):
     base_url: str
     api_key: SecretStr = SecretStr("")
     model_name: str
+    thinking: bool = False
     timeout_seconds: float = Field(default=30, gt=0)
     operation_path: str | None = None
     temperature: float = Field(default=0, ge=0, le=2)
@@ -186,6 +219,7 @@ class RetrievalSettings(BaseModel):
 
 
 class GenerationSettings(BaseModel):
+    cross_language_generation: bool = True
     require_citations: bool = True
     reject_on_no_evidence: bool = True
     allow_partial_answer: bool = True
@@ -206,6 +240,11 @@ class GenerationSettings(BaseModel):
     document_section_prompt_path: str = "prompts/document_section_generation.txt"
     document_section_prompt_version: str = "document-section-generation-v1"
     comparison_matrix_first: bool = True
+    # 答案生成模式：deterministic=确定性构建优先（现状）；llm=直接由模型(API)生成。
+    answer_mode: Literal["deterministic", "llm", "hybrid"] = "deterministic"
+    # 确定性答案生成后，再让模型用通俗语言"再讲一遍"（只转述、不新增事实）。
+    explain_enabled: bool = False
+    explain_prompt_path: str = "prompts/answer_explanation.txt"
     comparison_summary_enabled: bool = True
     comparison_summary_timeout_seconds: float = Field(default=30, gt=0)
     comparison_summary_max_attempts: int = Field(default=1, ge=0, le=1)
@@ -282,6 +321,26 @@ class Settings(BaseModel):
     ragas: RagasSettings = Field(default_factory=RagasSettings)
     logging: LoggingSettings
 
+    @model_validator(mode="after")
+    def _auto_enable_remote_model_stages(self) -> Settings:
+        """When an answer/verifier model endpoint is a remote (API) service,
+        auto-enable the model-dependent stages (planning, translation,
+        comparison summary) that default to off for the local-only setup.
+        Explicit env overrides (PLANNING_MODEL_ENABLED, TRANSLATION_MODEL_ENABLED,
+        COMPARISON_SUMMARY_ENABLED) take precedence over this auto behaviour."""
+        remote_api = any(
+            endpoint.enabled and not _is_local_url(endpoint.base_url)
+            for endpoint in (self.models.answer, self.models.verifier)
+        )
+        if remote_api:
+            if os.getenv("PLANNING_MODEL_ENABLED") is None:
+                self.planning.model_enabled = True
+            if os.getenv("TRANSLATION_MODEL_ENABLED") is None:
+                self.translation.model_enabled = True
+            if os.getenv("COMPARISON_SUMMARY_ENABLED") is None:
+                self.generation.comparison_summary_enabled = True
+        return self
+
     def public_view(self) -> dict[str, object]:
         """Expose operational settings while omitting credentials and connection secrets."""
         model_view = {
@@ -290,6 +349,8 @@ class Settings(BaseModel):
                 "required": endpoint.required,
                 "base_url": endpoint.base_url,
                 "model_name": endpoint.model_name,
+                "thinking": endpoint.thinking,
+                "max_output_tokens": endpoint.max_output_tokens,
                 "timeout_seconds": endpoint.timeout_seconds,
                 "operation_path": endpoint.operation_path,
             }

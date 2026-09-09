@@ -7,6 +7,7 @@ import httpx
 from app.core.config import RagflowSettings
 from app.core.exceptions import AppError
 from app.schemas.retrieval import ChunkMetadata, RagflowRetrievalRequest, RetrievedChunk
+from app.services.citation_location import published_page_number
 from app.services.probe import ProbeResult
 
 
@@ -179,6 +180,23 @@ class RagflowClient:
                 result.append({"id": document_id, "name": name})
         return result
 
+    async def download_document(self, dataset_id: str, document_id: str) -> tuple[bytes, str]:
+        """下载文档原始文件（PDF），返回 (content, content_type)。"""
+        try:
+            response = await self._client.get(
+                f"api/v1/datasets/{dataset_id}/documents/{document_id}"
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise AppError(
+                code="RAGFLOW_UNAVAILABLE",
+                message="RAGFlow 无法下载该文档原始文件。",
+                status_code=503,
+                details={"error_type": type(exc).__name__},
+            ) from exc
+        content_type = response.headers.get("content-type", "application/pdf")
+        return response.content, content_type
+
     @staticmethod
     def _normalize_chunk(item: dict[str, object]) -> RetrievedChunk | None:
         chunk_id = item.get("id") or item.get("chunk_id")
@@ -204,6 +222,20 @@ class RagflowClient:
             or item.get("docnm_kwd")
         )
         metadata_values["document_name"] = document_name
+        # RAGFlow 把页码放在 positions 里（[[page, x1, x2, y1, y2], ...]），
+        # 而非 document_metadata；取首条位置的分页号作为该 chunk 所在页码。
+        positions = item.get("positions")
+        if isinstance(positions, list) and positions:
+            first_position = positions[0]
+            if (
+                isinstance(first_position, (list, tuple))
+                and first_position
+                and isinstance(first_position[0], (int, float))
+            ):
+                if not metadata_values.get("page_number"):
+                    metadata_values["page_number"] = int(first_position[0])
+        if not metadata_values.get("page_number"):
+            metadata_values["page_number"] = published_page_number(str(text))
         allowed_metadata = {
             field: metadata_values.get(field)
             for field in ChunkMetadata.model_fields

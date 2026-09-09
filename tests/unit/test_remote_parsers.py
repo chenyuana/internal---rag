@@ -6,12 +6,104 @@ from io import BytesIO
 from pathlib import Path
 
 import httpx
+import pytest
 from PIL import Image, ImageDraw
 from pypdf import PdfWriter
 
 from app.core.config import IngestionSettings, RemoteParserSettings
 from app.ingestion.parsers import DoclingClient, MinerUClient, ParserRegistry
-from app.ingestion.parsers.remote import clean_inline_latex, latex_to_text
+from app.ingestion.parsers.remote import clean_inline_latex, formula_latex, latex_to_text
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (r"\pmb { V } _ { { s } _ { 0 } }", "V_s0"),
+        (r"{ { \pmb { V } } _ { { { s } _ { 0 } } } } ^ { 2 }", "V_s0^2"),
+        (r"\pmb { V } _ { \pmb { s _ { 1 } } }", "V_s1"),
+        (r"{\pmb V}_{s_{0}}^{2}", "V_s0^2"),
+        (r"\pm \pmb{V}_{s_{0}}^{2}", "±V_s0^2"),
+        (r"\mp 7\%", "∓7%"),
+        (r"\pmatrix{a}", "a"),
+        (r"\pmbextra{V}", "V"),
+    ],
+)
+def test_latex_complete_commands_preserve_bold_variables_and_real_signs(source, expected):
+    assert latex_to_text(source) == expected
+
+
+def test_page5_inline_climb_formula_does_not_invent_plus_minus():
+    source = (
+        r"(1) Each airplane with a $\pmb { V } _ { { s } _ { 0 } }$ "
+        r"of more than 70 miles per hour must be able to maintain a steady rate "
+        r"of climb of at least 0.02 ${ { \pmb { V } } _ { { { s } _ { 0 } } } } ^ { 2 }$ "
+        r"(that is, the number of feet per minute is obtained by multiplying "
+        r"the square of the number of miles per hour by 0.02)."
+    )
+    result = clean_inline_latex(source)
+    assert "with a V_s0 of more than 70" in result
+    assert "at least 0.02 V_s0^2 (that is" in result
+    assert "±" not in result and "pmb" not in result
+
+
+def test_hic_formula_repairs_unambiguous_t1_t2_subscripts():
+    raw = {
+        "type": "equation",
+        "text": (
+            r"H I C = \left\{ ( t _ { : } - t _ { : } ) "
+            r"\left[ \frac { 1 } { ( t _ { : } - t _ { : } ) } "
+            r"\intop _ { t _ { : } } ^ { t _ { 2 } } a ( t ) d t "
+            r"\right] ^ { 2 . 5 } \right\} _ { M a x }"
+        ),
+    }
+    latex = formula_latex(raw)
+    assert latex is not None
+    assert "t_{2}-t_{1}" in latex
+    assert r"\int_{t_{1}}^{t_{2}}" in latex
+    text = MinerUClient._item_text(raw)
+    assert "t2-t1" in text
+    assert "∫_t1^t2" in text
+    assert "t:" not in text
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            (
+                r"$$\n\mathbf { L } _ { \mathbf { \ S } \mathbf { \ S } \mathbf { \ S } } "
+                r"= \frac { \mathbf { K } _ { \mathbf { \ S } \mathbf { \Phi } } "
+                r"\mathbf { U } _ { \mathbf { \Phi } \mathbf { d e } } \mathbf { \nabla } "
+                r"\mathbf { V } \mathbf { \varPsi } \mathbf { a } _ { \mathbf { \ S } "
+                r"\mathbf { \Phi } } \mathbf { S } _ { \mathbf { \Phi } \mathbf { \Phi } } } "
+                r"{ 4 9 8 }\n$$"
+            ),
+            r"L_{vt} = \frac{K_{gt} U_{de} V a_{vt} S_{vt}}{498}",
+        ),
+        (
+            r"\mathbf { k } _ { \mathbf { g }  t } = { \frac { 0 . 8 8 \mu _ { \mathbf { g } t } } { 5 . 3 + \mu _ { \mathbf { g } t } } } =",
+            r"k_{gt} = \frac{0.88\mu_{gt}}{5.3 + \mu_{gt}}",
+        ),
+        (
+            r"\mu _ { { _ \mathrm { g t } } } = \frac { 2 \mathrm { W } } { \rho \mathrm { c _ { t } } { \mathrm { g } } \mathrm { a } _ { \mathrm { v t } } \mathrm { S } _ { \mathrm { v t } } } \frac { \mathrm { K } } { \mathrm { I } _ { \mathrm { v t } } } ^ { 2 }",
+            r"\mu_{gt} = \frac{2W}{\rho\bar{c}_{t} g a_{vt} S_{vt}}\frac{K^{2}}{l_{vt}^{2}}",
+        ),
+    ],
+)
+def test_formula_ocr_recovers_complete_gust_load_identities(raw, expected):
+    assert formula_latex({"type": "equation", "text": raw}) == expected
+    assert MinerUClient._item_text({"type": "equation", "text": raw}) == latex_to_text(
+        expected
+    )
+
+
+def test_formula_ocr_does_not_rewrite_a_nearby_valid_mass_ratio():
+    source = r"\mu_{gt}=\frac{2W}{\rho c_t g a_{vt}S_{vt}}\frac{K}{l_{vt}}"
+    assert formula_latex({"type": "equation", "text": source}) == source
+
+
+def test_latex_to_text_keeps_a_symbol_before_an_accented_variable():
+    assert latex_to_text(r"\rho\bar{c}_{t}") == "ρc_t"
 
 
 def test_mineru_preserves_margins_uncaptioned_images_and_formula_metadata() -> None:
@@ -41,6 +133,37 @@ def test_mineru_preserves_margins_uncaptioned_images_and_formula_metadata() -> N
     assert mapped[11][0].image_content == b"image"
     assert mapped[11][1].text_level == 2
     assert mapped[11][2].latex == "F=ma"
+
+
+def test_mineru_promotes_display_formula_mislabeled_as_text() -> None:
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "doc/doc_content_list.json",
+            json.dumps(
+                [
+                    {
+                        "type": "text",
+                        "text": (
+                            r"$\mathbf { k } _ { g t } = \frac { 0.88 \mu _ { g t } } "
+                            r"{ 5.3 + \mu _ { g t } }$ gust alleviation factor;"
+                        ),
+                        "page_idx": 0,
+                        "bbox": [100, 200, 400, 250],
+                    }
+                ]
+            ),
+        )
+
+    result = MinerUClient._read_archive(buffer.getvalue())
+
+    formula, explanation = result.page_blocks[1]
+    assert formula.block_type == "formula"
+    assert formula.latex is not None and r"\frac" in formula.latex
+    assert "k_gt=" in formula.text
+    assert explanation.block_type == "paragraph"
+    assert explanation.text == "gust alleviation factor;"
+    assert "gust alleviation factor;" in result.page_texts[1]
 
 
 def _pdf(path: Path, *, pages: int = 1) -> None:

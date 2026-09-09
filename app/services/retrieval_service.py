@@ -10,9 +10,8 @@ from uuid import uuid4
 from app.core.config import Settings
 from app.core.exceptions import AppError
 from app.core.middleware import current_request_id
-from app.ingestion.regulations import text_contains_article_alias
 from app.schemas.evidence import EvidenceRecord
-from app.schemas.planning import PlannedCell, QueryPlanV2, SubjectResolution
+from app.schemas.planning import PlannedCell, QueryPlanV2, RetrievalQuery, SubjectResolution
 from app.schemas.retrieval import (
     Citation,
     CoverageCell,
@@ -30,6 +29,7 @@ from app.schemas.retrieval import (
     SelectedChunk,
 )
 from app.services.access_control import AccessControlService
+from app.services.article_identity import owns_requested_article
 from app.services.cell_evidence import cell_has_substantive_evidence
 from app.services.citation_service import CitationService
 from app.services.coverage_selector import CoverageSelector
@@ -39,7 +39,7 @@ from app.services.query_scope import (
     declared_scope_cores,
     document_in_scope,
 )
-from app.services.query_translator import QueryTranslator
+from app.services.query_translator import QueryTranslator, has_translatable_topic
 from app.services.ragflow_client import RagflowClient
 from app.services.registry import ServiceRegistry
 from app.services.requirement_taxonomy import (
@@ -870,14 +870,50 @@ class RetrievalService:
                 else self._settings.retrieval.similarity_threshold
             ),
             vector_similarity_weight=self._settings.retrieval.vector_similarity_weight,
-            keyword=(
-                self._settings.retrieval.enable_ragflow_keyword_extraction
-                or bool(query.article_ids)
-            ),
+            # RAGFlow's ``keyword`` option calls the tenant chat model before
+            # retrieval. Article identifiers are already preserved verbatim in
+            # ``question`` and handled by exact ownership ranking below, so they
+            # must not implicitly trigger that slow, generative expansion.
+            keyword=self._settings.retrieval.enable_ragflow_keyword_extraction,
             metadata_condition=metadata_condition,
         )
         raw_chunks = await self._ragflow.retrieve(ragflow_request)
         failures: list[RetrievalFailure] = []
+        translation_calls = 0
+        translated_retrieval_calls = 0
+        # Single-query article lookups never visit the multi-cell translation
+        # path. Add at most one bounded variant here, retaining original hits,
+        # access filters and document IDs. Never translate recursive cell calls.
+        if (
+            plan is not None and not plan.requires_multi_query
+            and query.article_ids and has_translatable_topic(query)
+            and self._settings.translation.max_total_translations > 0
+        ):
+            cell = PlannedCell(
+                id="q1", subject=None, aspect=query.original_query[:200],
+                original_query=query.original_query[:500],
+                retrieval_queries=[RetrievalQuery(
+                    kind="original", text=query.original_query[:500], generated_by="user",
+                )],
+            )
+            outcome = await self._query_translator.translate(
+                query=query, cell=cell,
+                section_titles=[c.metadata.section_title or "" for c in raw_chunks[:5]],
+            )
+            translation_calls = outcome.model_calls
+            if outcome.decision.should_translate:
+                try:
+                    supplemental = await self._ragflow.retrieve(ragflow_request.model_copy(
+                        update={"question": outcome.decision.translated_query},
+                    ))
+                    translated_retrieval_calls = 1
+                    raw_chunks.extend(supplemental)
+                except AppError as exc:
+                    failures.append(RetrievalFailure(
+                        stage="article_translation", error_code=exc.code,
+                        message=exc.message, dataset_ids=allowed_datasets,
+                        document_ids=request.document_ids,
+                    ))
         deterministic_fallback = False
         if (
             not raw_chunks
@@ -926,6 +962,7 @@ class RetrievalService:
                 document_ids=request.document_ids,
                 metadata_values=metadata_values,
                 article_aliases=query.article_aliases,
+                article_ids=query.article_ids,
                 similarity_threshold=similarity_threshold,
             )
             dedup_key = (chunk.document_id, " ".join(chunk.text.split()))
@@ -938,7 +975,7 @@ class RetrievalService:
 
         accepted.sort(
             key=lambda item: (
-                text_contains_article_alias(item.text, query.article_aliases),
+                owns_requested_article(item, query.article_ids),
                 item.hybrid_score,
             ),
             reverse=True,
@@ -961,7 +998,7 @@ class RetrievalService:
             )
             accepted.sort(
                 key=lambda item: (
-                    text_contains_article_alias(item.text, query.article_aliases),
+                    owns_requested_article(item, query.article_ids),
                     item.hybrid_score,
                 ),
                 reverse=True,
@@ -988,7 +1025,7 @@ class RetrievalService:
         exact_matches = [
             item
             for item in rerank_input
-            if text_contains_article_alias(item.text, query.article_aliases)
+            if owns_requested_article(item, query.article_ids)
         ]
         reranker_used = False
         reranker_fallback = False
@@ -1101,10 +1138,12 @@ class RetrievalService:
                 "post_filter_accepted": len(accepted),
                 "rerank_input": len(rerank_input),
                 "article_exact_matches": len(exact_matches),
+                "article_translated_retrieval_calls": translated_retrieval_calls,
                 "final_selected": len(selected),
                 **({"deterministic_fallback": 1} if deterministic_fallback else {}),
             },
             candidates=debug_items,
+            model_call_counts={"translator": translation_calls},
             failures=failures,
             deterministic_fallback=deterministic_fallback,
         )
@@ -1433,6 +1472,7 @@ class RetrievalService:
                     document_ids=None,
                     metadata_values=metadata_values,
                     article_aliases=query.article_aliases,
+                    article_ids=query.article_ids,
                     similarity_threshold=0.0,
                 )
                 dedup_key = (chunk.document_id, " ".join(chunk.text.split()))
@@ -1775,13 +1815,14 @@ class RetrievalService:
         document_ids: list[str] | None = None,
         metadata_values: dict[str, str],
         article_aliases: list[str],
+        article_ids: list[str] | None = None,
         similarity_threshold: float | None = None,
     ) -> str | None:
         if chunk.dataset_id not in allowed_datasets:
             return "unauthorized_dataset"
         if document_ids and chunk.document_id not in document_ids:
             return "document_scope_mismatch"
-        exact_article_match = text_contains_article_alias(chunk.text, article_aliases)
+        exact_article_match = owns_requested_article(chunk, article_ids or [])
         if (
             chunk.hybrid_score
             < (

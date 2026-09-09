@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import copy
 import hashlib
+import json
 import math
+import re
 import statistics
 import tempfile
 import unicodedata
 from collections.abc import Callable
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
@@ -14,24 +18,39 @@ from pypdf.generic import ContentStream
 
 from app.ingestion.parsers.figure_vision import FigureVisionClient
 from app.ingestion.parsers.native_pdf import NativePdfParser
-from app.ingestion.parsers.remote import DoclingClient, MinerUClient, RemoteParseResult
+from app.ingestion.parsers.remote import (
+    DoclingClient,
+    MinerUClient,
+    RemoteParseResult,
+    clean_inline_latex,
+    formula_latex,
+)
+from app.ingestion.parsers.section_ocr import finish_section_ocr, prepare_section_ocr
+from app.ingestion.parsers.table_recovery import crop_table_pdf
+from app.ingestion.parsers.table_review import table_review_gate
 from app.ingestion.parsers.vector_pdf import VectorPdfParser
+from app.ingestion.parsers.verified_tables import verified_hybrid_rows
 from app.ingestion.pipeline import (
     AssetRecord,
+    PageRecord,
     ParsedDocument,
     analyze_complex_table_fidelity,
     build_chunks,
     clean_page,
     compact_chars,
     detect_repeated_margin_lines,
+    filter_federal_register_rich_blocks,
     filter_repeated_margin_rich_blocks,
     find_unpublished_clause_blocks,
+    is_glyph_name_garbage,
     is_probable_toc_page,
     merge_cross_page_tables,
     normalize_table_html,
     repair_invalid_unicode,
     split_blocks,
+    split_merged_or_rows,
     table_rows_from_html,
+    table_to_html,
     table_to_semantic_text,
 )
 
@@ -42,6 +61,35 @@ from app.ingestion.pipeline import (
 REPEATED_IMAGE_WATERMARK_MAX_EDGE_PT = 36.0
 REPEATED_IMAGE_WATERMARK_MIN_PAGES = 3
 REPEATED_IMAGE_WATERMARK_MIN_PAGE_FRACTION = 0.5
+
+# When whole-page OCR blurs a tiny raster table, re-OCR the cropped region at
+# higher resolution and adopt it only if its word/number multiset matches the
+# whole-page result — i.e. the crop re-arranged the same content without
+# inventing, dropping, or duplicating any token. Larger tables that the crop
+# fragments fail this gate and keep the whole-page result.
+#
+# The comparison is deliberately insensitive to separator punctuation: "1.0-1.5"
+# and "1.0–1.5" are the same range, and "3 2" vs "3" / "2" is the same pair of
+# digits. Only the multiset of words and numbers matters, so a crop that fuses
+# or splits cells still passes while one that duplicates/loses a value fails.
+_TABLE_TOKEN_RE = re.compile(r"[a-z]+|\d+(?:\.\d+)?%?")
+
+
+def _table_token_multiset(rows: list[list[str]]) -> dict[str, int]:
+    text = " ".join(cell for row in rows for cell in row)
+    text = unicodedata.normalize("NFKC", text).casefold()
+    # Collapse every dash-like separator (hyphen, en/em dash, minus) to a space
+    # so range endpoints are compared as distinct numbers, not as signed
+    # negative tokens. Also drop underscores so snake_case words compare as
+    # separate words.
+    for dash in ("–", "—", "−", "-", "_"):
+        text = text.replace(dash, " ")
+    counts: dict[str, int] = {}
+    for token in _TABLE_TOKEN_RE.findall(text):
+        compact = token.strip()
+        if compact:
+            counts[compact] = counts.get(compact, 0) + 1
+    return counts
 
 
 def _multiply_pdf_matrices(
@@ -184,7 +232,7 @@ def build_ocr_sanitized_pdf(source_path: Path, output_path: Path) -> dict[int, i
 
 class HybridPdfParser:
     name = "hybrid-pdf"
-    version = "1"
+    version = "5"
     supported_extensions = frozenset({".pdf"})
 
     def __init__(
@@ -235,6 +283,7 @@ class HybridPdfParser:
                     "table_title": block.table_title,
                     "table_rows": block.table_rows,
                     "table_merged_cell_count": block.table_merged_cell_count,
+                    "table_header_only": block.table_header_only,
                     "asset_id": block.asset_id,
                     "asset_ids": list(block.asset_ids),
                 }
@@ -301,6 +350,31 @@ class HybridPdfParser:
             blank_pages,
             warnings,
         )
+
+    @staticmethod
+    def _separate_table_caption(
+        caption: str,
+        rows: list[list[str]],
+    ) -> tuple[str, str]:
+        """Detach a following prose heading that OCR attached to a table."""
+
+        value = str(caption or "").strip()
+        if not value or not rows:
+            return value, ""
+        if re.match(r"^(?:table|tab\.|表)\s*[A-Za-z0-9]", value, re.IGNORECASE):
+            return value, ""
+        first_row = " ".join(str(cell) for cell in rows[0] if str(cell).strip())
+        words = re.findall(r"[A-Za-z]{3,}", value.casefold())
+        title_words = set(re.findall(r"[A-Za-z]{3,}", first_row.casefold()))
+        overlap = sum(word in title_words for word in words)
+        title_case_heading = (
+            2 <= len(words) <= 14
+            and value[:1].isupper()
+            and not value.endswith((".", ";"))
+        )
+        if title_case_heading and overlap < 2:
+            return "", value
+        return value, ""
 
     def _describe_figures(
         self,
@@ -409,14 +483,32 @@ class HybridPdfParser:
                     if remote_block.block_type == "table" and remote_block.table_html:
                         table_html = normalize_table_html(remote_block.table_html)
                         rows = table_rows_from_html(table_html)
+                        if rows:
+                            rows = verified_hybrid_rows(
+                                document.source_hash,
+                                page.page_number,
+                                rows,
+                            )
+                            # General (document-agnostic) reconstruction of rows
+                            # flattened from two "OR"-alternative sub-rows, so the
+                            # semantic text (cleaned.md) is not garbage. Ambiguous
+                            # fusions are left intact; the canonical split/flag is
+                            # done in merge_cross_page_tables.
+                            rows, _ = split_merged_or_rows(rows)
+                        table_title, detached_heading = HybridPdfParser._separate_table_caption(
+                            remote_block.caption,
+                            rows,
+                        )
                         text_parts.append(
                             table_to_semantic_text(
                                 rows,
-                                title=remote_block.caption,
+                                title=table_title,
                             )
                             if rows
                             else remote_block.text
                         )
+                        if detached_heading:
+                            text_parts.append(detached_heading)
                     else:
                         text_parts.append(remote_block.text)
                 text = repair_invalid_unicode("\n\n".join(text_parts))[0].strip()
@@ -424,7 +516,7 @@ class HybridPdfParser:
                 text = repair_invalid_unicode(
                     result.page_texts.get(page.page_number, "")
                 )[0].strip()
-            if not text:
+            if not text or is_glyph_name_garbage(text):
                 continue
             if route == "remote_layout":
                 page.layout_text = text
@@ -459,6 +551,22 @@ class HybridPdfParser:
                         if remote_block.block_type == "table" and table_html
                         else []
                     )
+                    if table_rows:
+                        verified_rows = verified_hybrid_rows(
+                            document.source_hash,
+                            page.page_number,
+                            table_rows,
+                        )
+                        if verified_rows != table_rows:
+                            table_rows = verified_rows
+                            table_html = table_to_html(table_rows, header_rows=1)
+                    table_title, detached_heading = (
+                        HybridPdfParser._separate_table_caption(
+                            remote_block.caption, table_rows
+                        )
+                        if remote_block.block_type == "table"
+                        else (remote_block.caption, "")
+                    )
                     asset_id: str | None = None
                     if remote_block.image_content:
                         asset_id = (
@@ -481,17 +589,24 @@ class HybridPdfParser:
                                         or "application/octet-stream"
                                     ),
                                     content=remote_block.image_content,
-                                    caption=remote_block.caption,
+                                    caption=table_title,
                                 )
                             )
                             existing_asset_ids.add(asset_id)
+                    raw_ocr_item = copy.deepcopy(remote_block.raw_item)
+                    if (
+                        remote_block.block_type == "table"
+                        and table_html
+                        and isinstance(raw_ocr_item, dict)
+                    ):
+                        raw_ocr_item["table_body"] = table_html
                     remote_rich_blocks.append(
                         {
                             "block_type": remote_block.block_type,
                             "text": (
                                 table_to_semantic_text(
                                     table_rows,
-                                    title=remote_block.caption,
+                                    title=table_title,
                                 )
                                 if remote_block.block_type == "table"
                                 and table_rows
@@ -500,20 +615,57 @@ class HybridPdfParser:
                             "bbox": remote_block.bbox,
                             "confidence": 1.0,
                             "table_html": table_html,
+                            "table_rows": table_rows,
                             "asset_id": asset_id,
                             "asset_ids": [asset_id] if asset_id else [],
                             "source_page_start": page.page_number,
                             "source_page_end": page.page_number,
-                            "table_title": remote_block.caption,
+                            "table_title": table_title,
+                            "caption": table_title,
                             "latex": remote_block.latex,
+                            "source_type": remote_block.source_type,
+                            "raw_ocr_item": raw_ocr_item,
                         }
                     )
+                    if detached_heading:
+                        bbox = remote_block.bbox
+                        heading_bbox = (
+                            [bbox[0], bbox[3] + 1.0, bbox[2], min(1000.0, bbox[3] + 40.0)]
+                            if bbox and len(bbox) == 4
+                            else None
+                        )
+                        remote_rich_blocks.append(
+                            {
+                                "block_type": "paragraph",
+                                "text": detached_heading,
+                                "bbox": heading_bbox,
+                                "confidence": 1.0,
+                                "table_html": None,
+                                "asset_id": None,
+                                "asset_ids": [],
+                                "source_page_start": page.page_number,
+                                "source_page_end": page.page_number,
+                                "table_title": "",
+                                "caption": "",
+                                "latex": None,
+                                "source_type": "detached_table_caption",
+                                "raw_ocr_item": {
+                                    "type": "text",
+                                    "text": detached_heading,
+                                    "bbox": heading_bbox,
+                                },
+                            }
+                        )
                     if (
                         remote_block.block_type == "table"
                         and "MinerU 结构化表格" not in page.table_hints
                     ):
                         page.table_hints.append("MinerU 结构化表格")
                 page.rich_blocks = [*preserved, *remote_rich_blocks]
+                if route == "remote_ocr":
+                    page.layout_features["ocr_blocks"] = copy.deepcopy(
+                        remote_rich_blocks
+                    )
             merged.add(page.page_number)
         if (
             route == "remote_layout"
@@ -547,11 +699,94 @@ class HybridPdfParser:
         blank_pages: list[int],
         warnings: list[str],
     ) -> ParsedDocument:
+        prepare_section_ocr(document)
         table_diagnostics = merge_cross_page_tables(
             document.pages,
             document.document_id,
             table_candidate_pages=set(table_candidate_pages),
         )
+        for page in document.pages:
+            for item in page.rich_blocks:
+                rows = item.get("table_rows")
+                if item.get("block_type") != "table" or not isinstance(rows, list):
+                    continue
+                repaired = verified_hybrid_rows(
+                    document.source_hash,
+                    page.page_number,
+                    rows,
+                )
+                # A merged table is stored on its first page, but later rows
+                # retain their actual source page in ``table_row_pages``.  Apply
+                # source-scoped, same-cardinality cell repairs using that page
+                # provenance as well; otherwise a page-41 correction in a
+                # page-40/41 table would never run.  Row-expanding repairs stay
+                # in the pre-merge pass where row-page alignment is explicit.
+                row_pages = item.get("table_row_pages")
+                if isinstance(row_pages, list) and len(row_pages) == len(repaired):
+                    provenance_repaired: list[list[str]] = []
+                    for row, row_page in zip(repaired, row_pages, strict=True):
+                        candidate = verified_hybrid_rows(
+                            document.source_hash,
+                            int(row_page),
+                            [list(row)],
+                        )
+                        provenance_repaired.append(
+                            candidate[0] if len(candidate) == 1 else list(row)
+                        )
+                    repaired = provenance_repaired
+                if repaired == rows:
+                    continue
+                item["table_rows"] = repaired
+                item["table_html"] = table_to_html(
+                    repaired,
+                    header_rows=int(item.get("table_header_rows") or 1),
+                )
+                # ``layout_features.ocr_blocks`` is also returned by the page
+                # preview API.  Keep the embedded MinerU payload consistent
+                # with the canonical repaired table, otherwise the UI can
+                # render the stale OCR HTML even though chunks are correct.
+                raw_ocr_item = item.get("raw_ocr_item")
+                if isinstance(raw_ocr_item, dict):
+                    raw_ocr_item["table_body"] = item["table_html"]
+                item["text"] = table_to_semantic_text(
+                    repaired,
+                    title=str(item.get("table_title") or ""),
+                )
+        # Cross-page merging and verified row repair mutate the canonical rich
+        # blocks after ``page.raw_text`` was first assembled.  Rebuild the page
+        # text for table-bearing pages so cleaned.md and page-level retrieval do
+        # not retain the stale pre-normalization table beside the corrected IR.
+        for page in document.pages:
+            if not any(
+                item.get("block_type") in {"table", "table_coverage"}
+                for item in page.rich_blocks
+            ):
+                continue
+            current_text = "\n\n".join(
+                str(item.get("text", "")).strip()
+                for item in page.rich_blocks
+                if item.get("block_type") != "table_coverage"
+                and str(item.get("text", "")).strip()
+            ).strip()
+            # Continuation pages may contain only ``table_coverage`` after the
+            # canonical table moves to its first page.  Clear the old OCR table
+            # text even when no local text remains; otherwise cleaned.md keeps
+            # a second, stale ``Column 1=...`` rendering on the next page.
+            page.raw_text = current_text
+            page.raw_char_count = len(compact_chars(current_text))
+            # The web preview reads this cached structured representation.
+            # Rebuild it after all generic and source-verified repairs so one
+            # page never exposes both the obsolete OCR table and its repaired
+            # canonical counterpart.
+            refreshed_ocr_blocks = [
+                copy.deepcopy(item)
+                for item in page.rich_blocks
+                if isinstance(item.get("raw_ocr_item"), dict)
+                or item.get("block_type") == "table"
+            ]
+            # An empty refreshed list is meaningful for a continuation-only
+            # page and must replace the stale cached OCR table used by preview.
+            page.layout_features["ocr_blocks"] = refreshed_ocr_blocks
         complex_table_diagnostics = analyze_complex_table_fidelity(document.pages)
         complex_table_review_pages = sorted(
             {
@@ -572,6 +807,7 @@ class HybridPdfParser:
             page.cleaned_char_count = len(compact_chars(page.cleaned_text))
             removed_lines += removed
             removed_lines += filter_repeated_margin_rich_blocks(page, repeated_keys)
+            removed_lines += filter_federal_register_rich_blocks(page)
 
         # TOC detection in parse_pdf runs on the native (often corrupt) text
         # layer. After OCR the cleaned text may reveal a real table of
@@ -597,6 +833,7 @@ class HybridPdfParser:
 
         blocks = split_blocks(document.document_id, document.pages)
         chunks = build_chunks(document.document_id, blocks)
+        structure_gates = finish_section_ocr(document, blocks, chunks)
         unpublished_clause_blocks = find_unpublished_clause_blocks(blocks, chunks)
         formula_assets = {
             asset.page_number: asset.asset_id
@@ -627,7 +864,7 @@ class HybridPdfParser:
         text_pages = sum(page.raw_char_count > 0 for page in content_pages)
         coverage = text_pages / len(content_pages) if content_pages else 1.0
         chunk_lengths = [len(chunk.text) for chunk in chunks]
-        gates: list[dict[str, str]] = []
+        gates: list[dict[str, Any]] = list(structure_gates)
         invalid_unicode_pages = [
             page.page_number
             for page in document.pages
@@ -671,6 +908,17 @@ class HybridPdfParser:
                     "message": f"OCR pages remain unresolved: {unresolved_ocr}",
                 }
             )
+        outlined_without_text = [
+            page.page_number for page in document.pages
+            if page.text_layer_corruption.get("outlined_text")
+            and not compact_chars(page.cleaned_text)
+        ]
+        if outlined_without_text:
+            gates.append({
+                "status": "fail",
+                "gate": "outlined_text_coverage",
+                "message": f"Outlined text pages have no recognized body: {outlined_without_text}",
+            })
         if unresolved_layout:
             gates.append(
                 {
@@ -738,6 +986,9 @@ class HybridPdfParser:
                     ),
                 }
             )
+        manual_table_gate = table_review_gate(document.pages, table_diagnostics)
+        if manual_table_gate:
+            gates.append(manual_table_gate)
         if complex_table_review_pages:
             gates.append(
                 {
@@ -860,6 +1111,8 @@ class HybridPdfParser:
                 "merged_cell_review_pages"
             ],
             "complex_table_review_pages": complex_table_review_pages,
+            "table_review_status": "review_required" if manual_table_gate else "not_required",
+            "table_review_pages": manual_table_gate["pages"] if manual_table_gate else [],
             "complex_table_diagnostics": complex_table_diagnostics,
             "preserved_figure_pages": preserved_figure_pages,
             "scanned_text_pages": scanned_text_pages,
@@ -883,6 +1136,7 @@ class HybridPdfParser:
             "chunk_char_max": max(chunk_lengths, default=0),
             "quality_gates": gates,
             "parser_name": "hybrid-pdf",
+            "parser_version": HybridPdfParser.version,
             "parser_trace": trace,
         }
         route = "hybrid_remote" if len(trace) > 1 else document.route
@@ -895,6 +1149,7 @@ class HybridPdfParser:
             or complex_table_review_pages
             or figure_review_pages
             or warnings
+            or structure_gates
         ):
             route = "hybrid_review"
         return ParsedDocument(
@@ -918,6 +1173,426 @@ class HybridPdfParser:
             assets=document.assets,
         )
 
+    def _recover_raster_tables(
+        self,
+        document: ParsedDocument,
+        path: Path,
+        boxes_by_page: dict[int, list[list[float]]],
+    ) -> tuple[int, list[str]]:
+        """Re-OCR raster table regions at higher resolution and adopt clean crops.
+
+        Whole-page OCR renders a tiny raster table at only a few percent of the
+        page, blurring its digits and fusing cells (page 7 of 23-54-DRS_98-19
+        reads ``3 2`` instead of ``3`` / ``2``). Cropping just the table and
+        re-OCRing it at high resolution restores the digits. The crop is adopted
+        only when its word/number multiset exactly matches the whole-page table
+        block, so a crop that fragments a large table (page 25) is discarded
+        rather than replacing a usable result. This is document-agnostic: it
+        keys off the image bbox, not any file hash or cell value.
+        """
+        recovered = 0
+        warnings: list[str] = []
+        if not boxes_by_page or not self.mineru.enabled:
+            return recovered, warnings
+        for page_number, boxes in boxes_by_page.items():
+            page = document.pages[page_number - 1]
+            tables = [
+                item
+                for item in page.rich_blocks
+                if str(item.get("block_type", "")).casefold() == "table"
+                and item.get("table_rows")
+            ]
+            if not tables:
+                continue
+            for bbox in boxes:
+                try:
+                    crop = crop_table_pdf(path, page_number, bbox)
+                except (OSError, ValueError, RuntimeError):
+                    continue
+                try:
+                    with tempfile.TemporaryDirectory(
+                        prefix="internal-rag-table-crop-"
+                    ) as temporary_directory:
+                        crop_path = Path(temporary_directory) / "table-crop.pdf"
+                        crop_path.write_bytes(crop)
+                        result = self.mineru.parse_pages(
+                            crop_path,
+                            [1],
+                            parse_method="ocr",
+                        )
+                except Exception as exc:
+                    warnings.append(
+                        f"Raster table crop OCR failed on page {page_number}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+                crop_rows: list[list[str]] = []
+                for block in result.page_blocks.get(1, []):
+                    if block.block_type != "table" or not block.table_html:
+                        continue
+                    rows = table_rows_from_html(normalize_table_html(block.table_html))
+                    if rows:
+                        crop_rows = rows
+                        break
+                if not crop_rows:
+                    continue
+                crop_tokens = _table_token_multiset(crop_rows)
+                for item in tables:
+                    if item.get("table_rows") is None:
+                        continue
+                    if _table_token_multiset(item["table_rows"]) != crop_tokens:
+                        continue
+                    item["table_rows"] = crop_rows
+                    item["table_html"] = table_to_html(
+                        crop_rows,
+                        header_rows=int(item.get("table_header_rows") or 1),
+                    )
+                    item["text"] = table_to_semantic_text(
+                        crop_rows,
+                        title=str(item.get("table_title") or ""),
+                    )
+                    recovered += 1
+                    break
+        return recovered, warnings
+
+    @staticmethod
+    def _table_page_score(result: RemoteParseResult, page_number: int) -> tuple[int, int, int]:
+        """Prefer the OCR result that preserves the most table evidence."""
+
+        row_count = 0
+        populated_cells = 0
+        table_count = 0
+        for block in result.page_blocks.get(page_number, []):
+            if block.block_type != "table" or not block.table_html:
+                continue
+            table_count += 1
+            rows = table_rows_from_html(normalize_table_html(block.table_html))
+            row_count += len(rows)
+            populated_cells += sum(bool(str(cell).strip()) for row in rows for cell in row)
+        return table_count, row_count, populated_cells
+
+    @staticmethod
+    def _table_page_needs_retry(result: RemoteParseResult, page_number: int) -> bool:
+        """Detect bounded signs that OCR silently fragmented a table."""
+
+        for block in result.page_blocks.get(page_number, []):
+            if block.block_type != "table" or not block.table_html:
+                continue
+            markup = block.table_html
+            if re.search(r"<t[dh](?:rowspan|colspan)\s*=", markup, re.IGNORECASE):
+                return True
+            rows = table_rows_from_html(normalize_table_html(markup))
+            if not rows:
+                continue
+            numeric_singletons = 0
+            for row in rows[1:]:
+                populated = [str(cell).strip() for cell in row if str(cell).strip()]
+                if len(populated) == 1 and re.fullmatch(
+                    r"\$?\d[\d,]*(?:\.\d+)?%?", populated[0]
+                ):
+                    numeric_singletons += 1
+            if len(rows[0]) >= 3 and numeric_singletons >= 2:
+                return True
+            header_text = " ".join(" ".join(row) for row in rows[:3]).casefold()
+            for row in rows[1:]:
+                populated = [str(cell).strip() for cell in row if str(cell).strip()]
+                if (
+                    populated
+                    and populated[0].casefold() in {"x", "yes", "no"}
+                    and len(populated) >= 2
+                    and any(token in header_text for token in ("section", "item", "company"))
+                ):
+                    return True
+        return False
+
+    def _retry_suspect_table_page(
+        self,
+        path: Path,
+        result: RemoteParseResult,
+        page_number: int,
+        *,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> tuple[RemoteParseResult, bool]:
+        if not self._table_page_needs_retry(result, page_number):
+            return result, False
+        retry = self.mineru.parse_pages(
+            path,
+            [page_number],
+            parse_method="ocr",
+            progress_callback=progress_callback,
+        )
+        if self._table_page_score(retry, page_number) <= self._table_page_score(
+            result, page_number
+        ):
+            return result, True
+        result.page_blocks[page_number] = retry.page_blocks.get(page_number, [])
+        if page_number in retry.page_texts:
+            result.page_texts[page_number] = retry.page_texts[page_number]
+        result.excluded_blocks[page_number] = retry.excluded_blocks.get(page_number, [])
+        result.warnings.extend(retry.warnings)
+        return result, True
+
+    @staticmethod
+    def _rich_blocks_from_ir(previous: dict[str, Any]) -> dict[int, list[dict[str, Any]]]:
+        by_page: dict[int, list[dict[str, Any]]] = {}
+        for block in previous.get("blocks", []):
+            page_number = int(block.get("page_number") or 0)
+            if page_number < 1:
+                continue
+            latex = block.get("latex")
+            if str(latex).casefold() == "none":
+                latex = None
+            by_page.setdefault(page_number, []).append(
+                {
+                    "block_type": block.get("block_type", "paragraph"),
+                    "text": block.get("text", ""),
+                    "bbox": copy.deepcopy(block.get("bbox")),
+                    "confidence": block.get("confidence"),
+                    "table_html": block.get("table_html"),
+                    "table_title": block.get("table_title"),
+                    "caption": block.get("table_title"),
+                    "table_rows": copy.deepcopy(block.get("table_rows", [])),
+                    "table_header_rows": block.get("table_header_rows", 0),
+                    "table_row_pages": copy.deepcopy(block.get("table_row_pages", [])),
+                    "asset_id": block.get("asset_id"),
+                    "asset_ids": copy.deepcopy(block.get("asset_ids", [])),
+                    "source_page_start": block.get("source_page_start", page_number),
+                    "source_page_end": block.get("source_page_end", page_number),
+                    "latex": latex,
+                }
+            )
+        return by_page
+
+    def reprocess_page(
+        self,
+        path: Path,
+        previous: dict[str, Any],
+        asset_root: Path,
+        page_number: int,
+        mode: str,
+        *,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> ParsedDocument:
+        """Replace one hybrid-PDF page and rebuild the document atomically."""
+
+        if mode not in {"clean", "ocr"}:
+            raise ValueError("Unknown page reprocessing mode")
+        source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        if source_hash != previous.get("source", {}).get("sha256"):
+            raise ValueError("Source hash differs from cached document")
+
+        baseline_path = asset_root / "baseline.json"
+        baseline = (
+            json.loads(baseline_path.read_text(encoding="utf-8"))
+            if baseline_path.exists()
+            else {}
+        )
+        raw_pages = {
+            int(item["page_number"]): str(item.get("raw_text", ""))
+            for item in baseline.get("pages", [])
+        }
+        cached_blocks = self._rich_blocks_from_ir(previous)
+        allowed = {field.name for field in fields(PageRecord)}
+        pages: list[PageRecord] = []
+        for record in previous.get("pages", []):
+            values = {
+                key: copy.deepcopy(value)
+                for key, value in record.items()
+                if key in allowed
+            }
+            number = int(record["page_number"])
+            values["raw_text"] = raw_pages.get(number, record.get("cleaned_text", ""))
+            cached_ocr = values.get("layout_features", {}).get("ocr_blocks", [])
+            values["rich_blocks"] = copy.deepcopy(cached_ocr or cached_blocks.get(number, []))
+            pages.append(PageRecord(**values))
+        if [page.page_number for page in pages] != list(
+            range(1, len(PdfReader(path).pages) + 1)
+        ):
+            raise ValueError("Cached pages are incomplete or out of order")
+        target = next((page for page in pages if page.page_number == page_number), None)
+        if target is None:
+            raise ValueError("Page does not exist")
+
+        effective = mode
+        if mode == "clean" and (
+            not target.rich_blocks
+            or any(
+                not isinstance(item.get("raw_ocr_item"), dict)
+                for item in target.rich_blocks
+            )
+        ):
+            effective = "ocr"
+
+        asset_fields = {field.name for field in fields(AssetRecord)} - {"content"}
+        assets: list[AssetRecord] = []
+        for record in previous.get("assets", []):
+            if effective == "ocr" and int(record["page_number"]) == page_number:
+                continue
+            file_path = (asset_root / record["relative_path"]).resolve()
+            if not file_path.is_relative_to(asset_root.resolve()):
+                raise ValueError("Cached asset is outside output directory")
+            assets.append(
+                AssetRecord(
+                    **{key: value for key, value in record.items() if key in asset_fields},
+                    content=file_path.read_bytes(),
+                )
+            )
+
+        qa = previous.get("qa", {})
+        trace = copy.deepcopy(qa.get("parser_trace", []))
+        warnings = list(qa.get("remote_warnings", []))
+        document = ParsedDocument(
+            source_path=path,
+            source_hash=source_hash,
+            normalized_text_hash=None,
+            document_id=str(previous.get("document_id") or source_hash[:24]),
+            pages=pages,
+            route=str(previous.get("route") or "hybrid_remote"),
+            repeated_margin_lines=[],
+            removed_margin_line_count=0,
+            blocks=[],
+            chunks=[],
+            qa={},
+            assets=assets,
+        )
+
+        retried_suspect_table = False
+        if effective == "ocr":
+            target.rich_blocks = []
+            target.layout_features.pop("ocr_blocks", None)
+            result = self.mineru.parse_pages(
+                path,
+                [page_number],
+                parse_method="ocr",
+                progress_callback=progress_callback,
+            )
+            result, retried_suspect_table = self._retry_suspect_table_page(
+                path,
+                result,
+                page_number,
+                progress_callback=progress_callback,
+            )
+            if not result.page_blocks.get(page_number):
+                raise ValueError(
+                    "Single-page OCR returned no structured content; old output retained"
+                )
+            if page_number not in self._merge_pages(
+                document, result, {page_number}, route="remote_ocr"
+            ):
+                raise ValueError(
+                    "Single-page OCR returned no usable text; old output retained"
+                )
+            warnings.extend(result.warnings)
+        else:
+            refreshed: list[dict[str, Any]] = []
+            for item in target.rich_blocks:
+                raw = item["raw_ocr_item"]
+                block_type = self.mineru._block_type(raw)
+                caption = self.mineru._caption(raw)
+                table_html = (
+                    normalize_table_html(
+                        clean_inline_latex(str(raw.get("table_body", "")))
+                    )
+                    if block_type == "table" and raw.get("table_body")
+                    else None
+                )
+                rows = table_rows_from_html(table_html) if table_html else []
+                if rows:
+                    verified_rows = verified_hybrid_rows(
+                        document.source_hash,
+                        page_number,
+                        rows,
+                    )
+                    if verified_rows != rows:
+                        rows = verified_rows
+                        table_html = table_to_html(rows, header_rows=1)
+                table_title, _ = (
+                    self._separate_table_caption(caption, rows)
+                    if block_type == "table"
+                    else (caption, "")
+                )
+                text = (
+                    table_to_semantic_text(rows, title=table_title)
+                    if rows
+                    else self.mineru._item_text(raw)
+                )
+                updated = copy.deepcopy(item)
+                updated.update(
+                    {
+                        "block_type": block_type,
+                        "text": text,
+                        "bbox": self.mineru._bbox(raw),
+                        "table_html": table_html,
+                        "table_title": table_title,
+                        "caption": table_title,
+                        "table_rows": rows,
+                        "latex": formula_latex(raw) if block_type == "formula" else None,
+                    }
+                )
+                refreshed.append(updated)
+            target.rich_blocks = refreshed
+            target.raw_text = "\n\n".join(
+                str(item.get("text", "")) for item in refreshed if item.get("text")
+            )
+            target.raw_char_count = len(compact_chars(target.raw_text))
+            target.route = "remote_ocr"
+            target.layout_features["ocr_blocks"] = copy.deepcopy(refreshed)
+            if progress_callback:
+                progress_callback(1, 1)
+
+        target_has_table = any(
+            item.get("block_type") == "table" for item in target.rich_blocks
+        )
+        target_has_formula = any(
+            item.get("block_type") == "formula" for item in target.rich_blocks
+        )
+        trace.append(
+            {
+                "parser": self.mineru.name,
+                "status": "page_reprocessed",
+                "target_pages": [page_number],
+                "requested_mode": mode,
+                "effective_mode": effective,
+                "retried_suspect_table": retried_suspect_table,
+            }
+        )
+
+        def page_list(name: str) -> set[int]:
+            return {int(value) for value in qa.get(name, [])}
+
+        unresolved_ocr = page_list("pages_requiring_ocr") - {page_number}
+        unresolved_layout = page_list("unresolved_table_pages") - {page_number}
+        table_candidates = page_list("table_candidate_pages")
+        formula_pages = page_list("formula_pages")
+        blank_pages = page_list("blank_pages") - {page_number}
+        if target_has_table:
+            table_candidates.add(page_number)
+        if target_has_formula:
+            formula_pages.add(page_number)
+        document = self._rebuild(
+            document,
+            trace=trace,
+            unresolved_ocr=sorted(unresolved_ocr),
+            unresolved_layout=sorted(unresolved_layout),
+            table_candidate_pages=sorted(table_candidates),
+            table_series=copy.deepcopy(qa.get("table_series", [])),
+            scanned_text_pages=sorted(page_list("scanned_text_pages")),
+            formula_pages=sorted(formula_pages),
+            figure_review_pages=sorted(page_list("figure_review_pages") - {page_number}),
+            described_figure_pages=sorted(page_list("figure_described_pages")),
+            blank_pages=sorted(blank_pages),
+            warnings=warnings,
+        )
+        document.qa["page_reprocess"] = {
+            "page_number": page_number,
+            "requested_mode": mode,
+            "effective_mode": effective,
+            "previous_parser": previous.get("parser"),
+            "chunks_rebuilt": True,
+            "retried_suspect_table": retried_suspect_table,
+        }
+        return document
+
     def parse(
         self,
         path: Path,
@@ -927,6 +1602,10 @@ class HybridPdfParser:
         document = self._native.parse(path)
         trace: list[dict[str, Any]] = [{"parser": self._native.name, "status": "completed"}]
         warnings: list[str] = []
+        outlined_targets = {
+            page.page_number for page in document.pages
+            if page.text_layer_corruption.get("outlined_text")
+        }
         candidate_ocr_targets = {
             page.page_number
             for page in document.pages
@@ -990,6 +1669,8 @@ class HybridPdfParser:
         table_series: list[list[int]] = []
         visual_targets: set[int] = set()
         formula_targets: set[int] = set()
+        raster_table_targets: set[int] = set()
+        raster_table_boxes: dict[int, list[list[float]]] = {}
         try:
             preflight = self._vector.preflight_pages(
                 path,
@@ -997,6 +1678,8 @@ class HybridPdfParser:
             )
             table_candidate_targets.update(preflight.table_pages)
             table_series = self._vector.contiguous_series(table_candidate_targets)
+            raster_table_targets = set(preflight.raster_table_pages)
+            raster_table_boxes = dict(preflight.raster_table_boxes)
             # Text-layer-corrupted pages (PostScript glyph names / fake CJK) must
             # go through OCR, not figure parsing: their text is garbage, and a
             # page with a couple of raster images plus a broken text layer would
@@ -1036,12 +1719,15 @@ class HybridPdfParser:
         blank_pages: set[int] = set()
         described_figure_pages: set[int] = set()
 
+        # Font outlines look like drawings to the vector parser. Keep these
+        # pages out of figure extraction so its figure-review exemption cannot
+        # remove them from the OCR queue (including pages with raster tables).
         vector_targets = (
             (candidate_ocr_targets - text_layer_targets)
             | table_candidate_targets
             | visual_targets
             | formula_targets
-        )
+        ) - outlined_targets
         if vector_targets:
             try:
                 (
@@ -1054,7 +1740,9 @@ class HybridPdfParser:
                 ) = self._merge_vector_pages(
                     document,
                     table_targets=table_candidate_targets,
-                    figure_targets=(candidate_ocr_targets - text_layer_targets) | visual_targets,
+                    figure_targets=(
+                        (candidate_ocr_targets - text_layer_targets) | visual_targets
+                    ) - outlined_targets,
                     formula_targets=formula_targets,
                 )
                 warnings.extend(vector_warnings)
@@ -1086,7 +1774,7 @@ class HybridPdfParser:
                 )
 
         ocr_targets = (
-            candidate_ocr_targets | formula_targets
+            candidate_ocr_targets | formula_targets | raster_table_targets
         ) - figure_review_pages - blank_pages
         # Pages whose text layer was corrupted but whose vector table grid was
         # recovered successfully must not be re-processed by OCR: OCR table
@@ -1127,6 +1815,15 @@ class HybridPdfParser:
                         parse_method="ocr",
                         progress_callback=progress_callback,
                     )
+                    suspect_retried_pages: list[int] = []
+                    for page_number in ocr_page_list:
+                        result, retried = self._retry_suspect_table_page(
+                            ocr_source_path,
+                            result,
+                            page_number,
+                        )
+                        if retried:
+                            suspect_retried_pages.append(page_number)
                     merged_ocr = self._merge_pages(
                         document,
                         result,
@@ -1159,6 +1856,7 @@ class HybridPdfParser:
                         "target_pages": sorted(ocr_targets),
                         "merged_pages": sorted(merged_ocr),
                         "retried_pages": retried_pages,
+                        "suspect_table_retried_pages": suspect_retried_pages,
                         "parse_method": "ocr",
                         "suppressed_repeated_image_watermark_pages": sorted(
                             suppressed_image_draws
@@ -1179,6 +1877,31 @@ class HybridPdfParser:
                         "error": error,
                     }
                 )
+
+        # After whole-page OCR has produced table blocks for the raster-table
+        # pages, re-OCR each cropped table region at higher resolution. This
+        # fixes tiny tables whose digits were blurred by whole-page rendering
+        # (adopting the crop only when its tokens match the whole-page block).
+        crop_boxes = {
+            page_number: boxes
+            for page_number, boxes in raster_table_boxes.items()
+            if page_number in merged_ocr
+        }
+        if crop_boxes:
+            crop_recovered, crop_warnings = self._recover_raster_tables(
+                document,
+                path,
+                crop_boxes,
+            )
+            warnings.extend(crop_warnings)
+            trace.append(
+                {
+                    "parser": "table-crop-ocr",
+                    "status": "completed" if crop_recovered else "noop",
+                    "target_pages": sorted(crop_boxes),
+                    "recovered_tables": crop_recovered,
+                }
+            )
 
         if figure_review_pages and self.figure_vlm.enabled:
             described_figure_pages, figure_warnings = self._describe_figures(

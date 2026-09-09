@@ -9,6 +9,7 @@ from pathlib import Path
 from docx import Document
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
+import pytest
 
 
 def wait_for_terminal_job(client: TestClient, job_id: str) -> dict:
@@ -166,6 +167,11 @@ def test_ingestion_interface_and_assets_are_available(client: TestClient) -> Non
 
     assert interface.status_code == 200
     assert 'id="fileInput"' in interface.text
+    assert 'id="recleanPageButton"' in interface.text
+    assert 'id="reocrPageButton"' in interface.text
+    assert 'id="pageActionHint"' in interface.text
+    assert "/assets/ingestion.js?v=20260901-page-reprocess-1" in interface.text
+    assert "/assets/ingestion.css?v=20260901-page-reprocess-1" in interface.text
     assert 'id="folderInput"' in interface.text
     assert "webkitdirectory" in interface.text
     assert 'id="selectFilesButton"' in interface.text
@@ -289,13 +295,15 @@ def test_rework_review_requires_note(client: TestClient, settings) -> None:
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("gate_name", ["complex_table_fidelity", "table_manual_review"])
 def test_manual_confirmation_can_override_failed_quality_gate(
     client: TestClient,
     settings,
+    gate_name: str,
 ) -> None:
     job_path, output = seed_editable_job(settings)
     failed_gate = {
-        "gate": "complex_table_fidelity",
+        "gate": gate_name,
         "status": "fail",
         "message": "需复核页面：[9, 15, 16]",
     }

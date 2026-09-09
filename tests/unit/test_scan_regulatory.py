@@ -10,11 +10,14 @@ from pypdf import PdfWriter
 
 from app.ingestion.parsers.remote import RemoteContentBlock, RemoteParseResult
 from app.ingestion.parsers.scan_regulatory import (
+    AMEND27805_SHA256,
     ScannedRegulatoryPdfParser,
+    _repair_reading_order,
     english_heading,
     is_scan_regulatory_pdf,
+    repair_formula_latex,
 )
-from app.ingestion.pipeline import PageRecord
+from app.ingestion.pipeline import BlockRecord, PageRecord
 
 
 class FakeImage:
@@ -114,6 +117,111 @@ def test_english_heading_detects_regulatory_headings() -> None:
     assert english_heading("§ 23.629 Flutter prevention") is not None
     # 非标题正文
     assert english_heading("This amendment adds Part 23 [New] to the Federal Aviation") is None
+
+
+def test_repair_reading_order_moves_wrapped_text_headings_and_wide_figures() -> None:
+    # This is the page-10 shape: the OCR payload places lower-column content
+    # before the right-column continuation and returns the spanning figure too
+    # early.  Geometry supplies enough evidence to repair it safely.
+    items = [
+        {
+            "block_type": "paragraph",
+            "text": "(3) Factors varying linearly with speed from the specified value at V_C to",
+            "bbox": [512, 259, 724, 288],
+        },
+        {
+            "block_type": "paragraph",
+            "text": "The selected design airspeeds are equivalent airspeeds (EAS).",
+            "bbox": [512, 696, 723, 726],
+        },
+        {"block_type": "paragraph", "text": "NOTE: Point G", "bbox": [512, 627, 723, 668]},
+        {
+            "block_type": "paragraph",
+            "text": "(a) Design cruising speed, V_C.",
+            "bbox": [512, 724, 723, 755],
+        },
+        {
+            "block_type": "paragraph",
+            "text": (
+                "0.0 at V_D for the normal category, and -1.0 at V_D for "
+                "the acrobatic category."
+            ),
+            "bbox": [729, 57, 940, 104],
+        },
+        {
+            "block_type": "paragraph",
+            "text": "(1) V_C may not be less than",
+            "bbox": [512, 755, 723, 788],
+        },
+        {
+            "block_type": "paragraph",
+            "text": "§ 23.335 Design airspeeds.",
+            "bbox": [513, 675, 657, 693],
+        },
+        {"block_type": "paragraph", "text": "(c) Gust envelope.", "bbox": [729, 104, 941, 193]},
+        {"block_type": "paragraph", "text": "(1) Positive gusts", "bbox": [729, 191, 939, 239]},
+        {"block_type": "figure", "text": "", "bbox": [520, 298, 932, 619]},
+        {
+            "block_type": "paragraph",
+            "text": "(2) Positive and negative gusts",
+            "bbox": [730, 239, 940, 272],
+        },
+        {"block_type": "paragraph", "text": "(d) Flight envelope.", "bbox": [742, 272, 848, 288]},
+    ]
+
+    ordered, report = _repair_reading_order(items)
+    texts = [item["text"] for item in ordered]
+    assert report["status"] == "repaired"
+    continuation = (
+        "0.0 at V_D for the normal category, and -1.0 at V_D for "
+        "the acrobatic category."
+    )
+    assert texts.index(continuation) == 1
+    assert texts.index("(c) Gust envelope.") < texts.index("")
+    assert texts.index("") < texts.index("NOTE: Point G")
+    assert texts.index("§ 23.335 Design airspeeds.") < texts.index(
+        "The selected design airspeeds are equivalent airspeeds (EAS)."
+    )
+
+
+def test_repair_reading_order_leaves_single_column_content_unchanged() -> None:
+    items = [
+        {"block_type": "paragraph", "text": "Heading", "bbox": [100, 100, 400, 120]},
+        {"block_type": "paragraph", "text": "Body", "bbox": [100, 130, 400, 180]},
+        {"block_type": "figure", "text": "", "bbox": [110, 200, 390, 260]},
+        {"block_type": "paragraph", "text": "After", "bbox": [100, 280, 400, 320]},
+    ]
+    ordered, report = _repair_reading_order(items)
+    assert ordered == items
+    assert report["status"] == "unchanged"
+
+
+def test_repair_reading_order_does_not_pull_lower_column_text_forward() -> None:
+    items = [
+        {
+            "block_type": "paragraph",
+            "text": "The requirements are specified as follows and",
+            "bbox": [500, 500, 700, 530],
+        },
+        {
+            "block_type": "paragraph",
+            "text": "A separate paragraph.",
+            "bbox": [720, 500, 930, 530],
+        },
+        {
+            "block_type": "paragraph",
+            "text": "continues in the right column.",
+            "bbox": [720, 700, 930, 730],
+        },
+        {
+            "block_type": "paragraph",
+            "text": "The next left-column section.",
+            "bbox": [500, 740, 700, 770],
+        },
+    ]
+    ordered, report = _repair_reading_order(items)
+    assert ordered == items
+    assert report["status"] == "unchanged"
 
 
 # ---------------------------------------------------------------- 解析器构建
@@ -333,8 +441,10 @@ def test_merged_table_rows_are_flagged_not_guessed(tmp_path: Path) -> None:
             "mineru", page_blocks={1: [RemoteContentBlock(1, "table", html, table_html=html)]}
         ),
     )
-    assert "607510" in doc.chunks[0].text
-    assert doc.chunks[0].table_html == [html]
+    assert "607510" not in doc.chunks[0].text
+    assert doc.chunks[0].table_html == []
+    assert doc.pages[0].rich_blocks[0]["raw_table_html"] == html
+    assert any(g["status"] == "fail" for g in doc.qa["quality_gates"])
     assert any(g["gate"] == "table_row_alignment" for g in doc.qa["quality_gates"])
 
 
@@ -388,3 +498,70 @@ def test_build_chunks_groups_under_english_heading_and_keeps_tables() -> None:
     assert text_chunks[0].title == "PART 23—AIRWORTHINESS STAND-ARDS"
     assert len(table_chunks) == 1
     assert table_chunks[0].table_html
+
+
+def _formula_block(latex: str) -> BlockRecord:
+    return BlockRecord(
+        block_id="b",
+        block_type="formula",
+        text="",
+        page_number=10,
+        section_path=[],
+        latex=latex,
+    )
+
+
+def test_repair_formula_latex_corrects_mu_gt_l_vt_squared_only():
+    mu = r"\mu_{gt} = \frac{2W}{\rho\bar{c}_{t} g a_{vt} S_{vt}}\frac{K^{2}}{l_{vt}^{2}}"
+    blocks = [
+        _formula_block(mu),
+        _formula_block(r"\frac{a}{b^{2}}"),
+        _formula_block(r"x^2 + y^2"),
+    ]
+    repair_formula_latex(blocks)
+    assert r"l_{vt}^{2}" not in blocks[0].latex
+    assert r"\frac{K^{2}}{l_{vt}}" in blocks[0].latex
+    # Untouched: other squared terms must not be rewritten.
+    assert blocks[1].latex == r"\frac{a}{b^{2}}"
+    assert blocks[2].latex == r"x^2 + y^2"
+
+
+def test_repair_formula_latex_hash_is_source_scoped():
+    assert AMEND27805_SHA256.startswith("71223230")
+    # A different source hash never triggers the correction path in _finish.
+    assert AMEND27805_SHA256 != "bf3738181740c26505f625e19a63f29c68b12a450463314559cbe59963fce3d0"
+
+
+def test_recover_formula_image_assets_creates_crop_for_cropless_formula(tmp_path):
+    from pypdf import PdfWriter
+
+    from app.ingestion.parsers.scan_regulatory import recover_formula_image_assets
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    pdf_path = tmp_path / "blank.pdf"
+    with pdf_path.open("wb") as fh:
+        writer.write(fh)
+
+    page = PageRecord(
+        page_number=1,
+        raw_text="",
+        rich_blocks=[
+            {
+                "block_type": "formula",
+                "text": "",
+                "latex": r"\frac{a}{b}",
+                "bbox": [100, 100, 400, 300],
+                "asset_id": None,
+                "asset_ids": [],
+            }
+        ],
+    )
+    assets = []
+    recover_formula_image_assets(pdf_path, [page], assets)
+
+    assert len(assets) == 1
+    assert assets[0].asset_type == "formula"
+    assert assets[0].mime_type == "image/png"
+    assert assets[0].content[:8] == b"\x89PNG\r\n\x1a\n"
+    assert page.rich_blocks[0]["asset_id"] == assets[0].asset_id

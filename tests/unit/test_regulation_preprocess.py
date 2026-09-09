@@ -1,3 +1,5 @@
+import pytest
+
 from app.ingestion import pipeline
 from app.ingestion.regulations import (
     REGULATION_MAX_CHARS,
@@ -373,6 +375,43 @@ def test_chunk_title_not_duplicated_when_heading_block_matches_section() -> None
     assert lines.count("B.4 像片重叠度") == 1
 
 
+def test_table_title_not_duplicated_between_context_and_semantic_body() -> None:
+    title = "Sec. 33.77 Foreign object ingestion"
+    block = pipeline.BlockRecord(
+        block_id="table-1",
+        block_type="table",
+        text=(
+            f"{title}\n"
+            "Foreign object=3-ounce size; Test quantity=One; "
+            "Speed of foreign object=Liftoff speed"
+        ),
+        page_number=13,
+        section_path=[title],
+        source_page_start=13,
+        source_page_end=15,
+        table_id="foreign-object-table",
+        table_title=title,
+        table_rows=[
+            ["Foreign object", "Test quantity", "Speed of foreign object"],
+            ["3-ounce size", "One", "Liftoff speed"],
+        ],
+        table_header_rows=1,
+        table_row_pages=[13, 14],
+    )
+
+    chunk = pipeline.chunk_from_blocks(
+        document_id="doc",
+        parent_chunk_id="parent",
+        title=title,
+        section_key=(title,),
+        blocks=[block],
+        ordinal=0,
+    )
+
+    assert chunk.text.splitlines().count(title) == 1
+    assert "Speed of foreign object=Liftoff speed" in chunk.text
+
+
 def test_clause_chunk_coverage_detects_a_missing_inline_clause() -> None:
     page = pipeline.PageRecord(
         page_number=1,
@@ -557,6 +596,293 @@ def test_merges_cross_page_table_and_removes_repeated_rows() -> None:
     ]
 
 
+@pytest.mark.parametrize("tail_title,expected_tables", [
+    ("", 1), ("Section 91.205 Powered civil", 1), ("Independent cost table", 2),
+])
+def test_merges_titleless_ordered_sections_and_open_tail(tail_title, expected_tables) -> None:
+    # A Federal Register-style summary table has one header on the first page,
+    # titleless continuation rows on the next pages, and a wrapped final row
+    # whose first-column tail appears above a new one-row grid on the last page.
+    pages = [
+        pipeline.PageRecord(
+            page_number=22,
+            raw_text="",
+            rich_blocks=[
+                {
+                    "block_type": "paragraph",
+                    "text": "Regulatory Evaluation Summary",
+                    "bbox": [10, 10, 240, 20],
+                },
+                {
+                    "block_type": "table",
+                    "table_rows": [
+                        ["Section", "Incremental Cost", "Benefit"],
+                        ["Section 23.729 Landing gear", "None...", "Clarification."],
+                    ],
+                    "bbox": [10, 100, 590, 780],
+                },
+            ],
+        ),
+        pipeline.PageRecord(
+            page_number=23,
+            raw_text="",
+            rich_blocks=[
+                {
+                    "block_type": "table",
+                    "table_rows": [[
+                        "Section 23.735 Brakes...",
+                        "None...",
+                        "Editorial.",
+                    ]],
+                    "table_header_only": True,
+                    "bbox": [10, 20, 590, 780],
+                }
+            ],
+        ),
+        pipeline.PageRecord(
+            page_number=24,
+            raw_text="",
+            rich_blocks=[
+                {
+                    "block_type": "table",
+                    "table_rows": [[
+                        "Section 23.867 Electrical bonding",
+                        "None...",
+                        "Editorial.",
+                    ]],
+                    "table_header_only": True,
+                    "bbox": [10, 20, 590, 780],
+                }
+            ],
+        ),
+        pipeline.PageRecord(
+            page_number=25,
+            raw_text="",
+            rich_blocks=[
+                {
+                    "block_type": "table",
+                    "table_rows": [[
+                        "Section 91.205 Powered civil aircraft with standard",
+                        "None...",
+                        "Safety, considered above.",
+                    ]],
+                    "table_header_only": True,
+                    "bbox": [10, 20, 590, 780],
+                }
+            ],
+        ),
+        pipeline.PageRecord(
+            page_number=26,
+            raw_text="",
+            rich_blocks=[
+                {
+                    "block_type": "table",
+                    "table_rows": [[
+                        "category U.S. airworthiness certificates:",
+                        "",
+                        "",
+                    ]],
+                    "table_header_only": True,
+                    "bbox": [10, 20, 590, 80],
+                },
+                {
+                    "block_type": "table",
+                    "table_rows": [[
+                        "Section 91.209 Aircraft lights.",
+                        "$25 per year per airplane",
+                        "Safety, considered above.",
+                    ]],
+                    "table_header_only": True,
+                    "bbox": [10, 81, 590, 110],
+                    "table_title": tail_title,
+                },
+            ],
+        ),
+    ]
+
+    diagnostics = pipeline.merge_cross_page_tables(pages, "faa-summary")
+    blocks = pipeline.split_blocks("faa-summary", pages)
+    tables = [block for block in blocks if block.block_type == "table"]
+
+    assert diagnostics["structured_table_count"] == expected_tables
+    assert diagnostics["cross_page_table_count"] == 1
+    assert diagnostics["invalid_table_pages"] == []
+    assert len(tables) == expected_tables
+    assert tables[0].table_title == "Regulatory Evaluation Summary"
+    assert tables[0].source_page_start == 22
+    assert tables[0].source_page_end == 26
+    if expected_tables == 1:
+        assert tables[0].table_rows[-1][0] == "Section 91.209 Aircraft lights."
+        assert "category U.S. airworthiness certificates:" in tables[0].table_rows[-2][0]
+    else:
+        assert tables[1].table_title == tail_title
+
+
+def test_merges_regulatory_summary_after_appendix_row_and_recovers_prior_heading() -> None:
+    pages = [
+        pipeline.PageRecord(
+            page_number=24,
+            raw_text="",
+            rich_blocks=[
+                {
+                    "block_type": "paragraph",
+                    "text": "Regulatory Evaluation Summary",
+                    "bbox": [40, 500, 300, 520],
+                },
+                {
+                    "block_type": "paragraph",
+                    "text": "All provisions of the proposed rule are summarized below.",
+                    "bbox": [40, 530, 560, 570],
+                },
+            ],
+        ),
+        pipeline.PageRecord(
+            page_number=25,
+            raw_text="",
+            rich_blocks=[
+                {
+                    "block_type": "table",
+                    "table_rows": [
+                        ["Section", "Description", "Incremental cost", "Benefit"],
+                        ["Section 23.1453", "Oxygen equipment", "$960", "Safety"],
+                        ["Section 23.1461", "High energy rotors", "None", "Clarifying"],
+                        ["Appendix F to part 23", "Test procedure", "None", "Minor safety"],
+                    ],
+                    "bbox": [20, 40, 580, 760],
+                }
+            ],
+        ),
+        pipeline.PageRecord(
+            page_number=26,
+            raw_text="",
+            rich_blocks=[
+                {
+                    "block_type": "table",
+                    "table_rows": [
+                        ["Section 91.205", "Aircraft equipment", "None", "Safety"],
+                        ["Section 91.209", "Aircraft lights", "$25 per year", "Safety"],
+                    ],
+                    "bbox": [20, 30, 580, 180],
+                }
+            ],
+        ),
+    ]
+
+    diagnostics = pipeline.merge_cross_page_tables(pages, "faa-summary-appendix")
+    tables = [
+        block
+        for block in pipeline.split_blocks("faa-summary-appendix", pages)
+        if block.block_type == "table"
+    ]
+
+    assert diagnostics["structured_table_count"] == 1
+    assert diagnostics["structured_table_pages"] == [25, 26]
+    assert len(tables) == 1
+    assert tables[0].table_title == "Regulatory Evaluation Summary"
+    assert tables[0].section_path == ["Regulatory Evaluation Summary"]
+    assert tables[0].source_page_end == 26
+    assert tables[0].table_rows[-1][0] == "Section 91.209"
+
+
+def test_rejects_wrapped_section_reference_sentence_as_heading() -> None:
+    assert (
+        pipeline.heading_kind(
+            "23.1587 as proposed new paragraph (d)(10). Because the AFM requirement would be added"
+        )
+        is None
+    )
+
+
+def test_replaces_header_fragment_title_with_nearby_regulation_heading() -> None:
+    page = pipeline.PageRecord(
+        page_number=13,
+        raw_text="",
+        rich_blocks=[
+            {
+                "block_type": "paragraph",
+                "text": "Sec. 33.77 Foreign object ingestion.",
+                "bbox": [34, 534, 240, 547],
+            },
+            {
+                "block_type": "paragraph",
+                "text": "under the following ingestion conditions:",
+                "bbox": [34, 714, 264, 727],
+            },
+            {
+                "block_type": "table",
+                "table_title": "Engine operation Ingestion",
+                "table_rows": [
+                    [
+                        "Foreign object",
+                        "Test quantity",
+                        "Speed of foreign object",
+                        "Engine operation",
+                        "Ingestion",
+                    ],
+                    ["Birds", "One", "Liftoff speed", "Takeoff", ""],
+                ],
+                "bbox": [36, 768, 560, 807],
+            },
+        ],
+    )
+
+    pipeline.merge_cross_page_tables([page], "foreign-object-table")
+    table = next(
+        block
+        for block in pipeline.split_blocks("foreign-object-table", [page])
+        if block.block_type == "table"
+    )
+
+    assert table.table_title == "Sec. 33.77 Foreign object ingestion"
+    assert table.section_path == ["Sec. 33.77 Foreign object ingestion"]
+
+
+def test_table_inherits_local_federal_regulation_paragraph_not_stale_article() -> None:
+    page = pipeline.PageRecord(
+        page_number=13,
+        raw_text="",
+        rich_blocks=[
+            {"block_type": "paragraph", "text": "33.78(a)(2) Previous discussion"},
+            {
+                "block_type": "paragraph",
+                "text": "Sec. 33.77 Foreign object ingestion.",
+            },
+            {
+                "block_type": "paragraph",
+                "text": "(e) Compliance must be shown under these conditions:",
+            },
+            {
+                "block_type": "table",
+                "text": (
+                    "Sec. 33.77 Foreign object ingestion\n"
+                    r"Foreign object=1\1/2\\-pound size; Test quantity=One"
+                ),
+                "table_title": "Sec. 33.77 Foreign object ingestion",
+                "table_id": "foreign-object-table",
+                "table_rows": [
+                    ["Foreign object", "Test quantity"],
+                    [r"1\1/2\\-pound size", "One"],
+                ],
+                "source_page_start": 13,
+                "source_page_end": 15,
+            },
+        ],
+    )
+
+    blocks = pipeline.split_blocks("federal-paragraph-table", [page])
+    table = next(block for block in blocks if block.block_type == "table")
+    chunk = next(
+        chunk
+        for chunk in pipeline.build_chunks("federal-paragraph-table", blocks)
+        if chunk.table_ids
+    )
+
+    assert table.article_id_raw == "33.77(e)"
+    assert table.article_id_normalized == "33.77(E)"
+    assert chunk.article_id_normalized == "33.77(E)"
+    assert r"1\1/2\\-pound size" in chunk.text
+
+
 def test_split_blocks_filters_continuation_title_residue() -> None:
     # 跨页续表合并后，续表标题"表N 续"和残留"( )"不携带表格数据，
     # 不应发布为空的噪声 chunk（GB 46750-2025 第11页"表1 数据包内容续"）。
@@ -596,6 +922,46 @@ def test_split_blocks_filters_continuation_title_residue() -> None:
     assert not any(text.strip() == "( )" for text in texts)
     assert any("5.2.2 运行识别信息数据包扩展内容" in text for text in texts)
     assert any("表2 数据类型与标识" in text for text in texts)
+
+
+def test_contained_continuation_rows_keep_later_page_provenance() -> None:
+    rows = [["Parameter", "Value"], ["Altitude", "100"], ["Heading", "360"]]
+    pages = [
+        pipeline.PageRecord(
+            page_number=27,
+            raw_text="",
+            cleaned_text="",
+            rich_blocks=[
+                {
+                    "block_type": "table",
+                    "table_title": "Appendix B",
+                    "table_rows": rows,
+                    "asset_id": "p0027-table-01",
+                }
+            ],
+        ),
+        pipeline.PageRecord(
+            page_number=28,
+            raw_text="",
+            cleaned_text="",
+            rich_blocks=[
+                {
+                    "block_type": "table",
+                    "table_title": "Appendix B",
+                    "table_rows": [rows[0], rows[1], rows[2]],
+                    "asset_id": "p0028-table-01",
+                }
+            ],
+        ),
+    ]
+
+    pipeline.merge_cross_page_tables(pages, "doc-contained-provenance")
+    table = next(
+        item for item in pages[0].rich_blocks if item.get("block_type") == "table"
+    )
+
+    assert table["table_rows"] == rows
+    assert table["table_row_pages"] == [27, 28, 28]
 
 
 def test_merge_accepts_single_row_multi_column_schematic() -> None:
@@ -690,6 +1056,31 @@ def test_merge_accepts_single_row_multi_column_schematic() -> None:
     ]
     assert all("<table>" in (part.table_html or "") for part in parts)
     assert all("<td" not in part.text.casefold() for part in parts)
+
+
+def test_keeps_moderate_single_page_table_as_one_chunk() -> None:
+    rows = [["Range", "Quantity"]] + [[str(index), "x" * 90] for index in range(16)]
+    block = pipeline.BlockRecord(
+        block_id="one-page-table",
+        block_type="table",
+        text=pipeline.table_to_semantic_text(rows, title="Table 2 Requirements"),
+        page_number=22,
+        section_path=[],
+        source_page_start=22,
+        source_page_end=22,
+        table_id="table-2",
+        table_title="Table 2 Requirements",
+        table_rows=rows,
+        table_header_rows=1,
+        table_row_pages=[22] * len(rows),
+        table_html=pipeline.table_to_html(rows),
+    )
+
+    parts = list(pipeline.split_structured_table_block(block, 1400))
+
+    assert len(block.text) > 1400
+    assert len(parts) == 1
+    assert parts[0].table_rows == rows
 
 
 def test_splits_multiple_page_tables_and_merges_named_continuation() -> None:
@@ -895,6 +1286,66 @@ def test_cross_page_table_continuation_satisfies_caption_reference() -> None:
 
     diagnostics = pipeline.merge_cross_page_tables(pages, "photo-load")
     assert diagnostics["table_caption_mismatch_pages"] == []
+
+
+def test_binds_bottom_page_english_caption_to_next_page_table() -> None:
+    pages = [
+        pipeline.PageRecord(
+            page_number=22,
+            raw_text="",
+            cleaned_text="",
+            rich_blocks=[
+                {
+                    "block_type": "table",
+                    "table_rows": [["Range", "Quantity"], ["0", "1"]],
+                    "bbox": [30, 260, 560, 700],
+                },
+                {
+                    "block_type": "paragraph",
+                    "text": "Table 3 to Sec. 33.76.--Additional Integrity Assessment",
+                    "bbox": [30, 780, 400, 795],
+                },
+                {
+                    "block_type": "paragraph",
+                    "text": "22/24",
+                    "bbox": [30, 815, 560, 830],
+                },
+            ],
+        ),
+        pipeline.PageRecord(
+            page_number=23,
+            raw_text="",
+            cleaned_text="",
+            rich_blocks=[
+                {
+                    "block_type": "table",
+                    "table_rows": [["Range", "Quantity"], ["1", "2"]],
+                    "bbox": [30, 30, 560, 200],
+                },
+                {
+                    "block_type": "paragraph",
+                    "text": "Next section",
+                    "bbox": [30, 250, 300, 265],
+                },
+                {
+                    "block_type": "paragraph",
+                    "text": "23/24",
+                    "bbox": [30, 815, 560, 830],
+                },
+            ],
+        ),
+    ]
+
+    diagnostics = pipeline.merge_cross_page_tables(pages, "final-rules")
+
+    table = next(item for item in pages[1].rich_blocks if item["block_type"] == "table")
+    assert table["table_title"] == "Table 3 to Sec. 33.76.--Additional Integrity Assessment"
+    assert table["text"].startswith("Table 3 to Sec. 33.76.--Additional Integrity Assessment\n")
+    assert all(
+        "Table 3 to Sec." not in str(item.get("text", ""))
+        for item in pages[0].rich_blocks
+    )
+    assert diagnostics["trailing_table_caption_bindings"] == 1
 
 
 def test_table_caption_reference_normalizes_fullwidth_digits() -> None:
@@ -1984,6 +2435,79 @@ def test_heading_kind_annex_with_label_is_heading() -> None:
     assert pipeline.heading_kind("附件 B") == "annex"
 
 
+def test_heading_kind_fr_amendment_appendix_boundary() -> None:
+    # 联邦公报改订正文里出现的"改写附录"边界行，必须判为 annex，从而重置被
+    # 运行页眉/修订节头（如 "Sec. 23.1587 Performance information."）污染的
+    # 章节栈——否则附录F 的测试方法与 (h) 验收准则会被错绑成 23.1587(H)(1)。
+    assert pipeline.heading_kind("63. Amend Appendix F to Part 23 as follows:") == "annex"
+    assert (
+        pipeline.heading_kind(
+            "A. Redesignate the existing text as Part I and add a new Part I heading;"
+        )
+        == "annex"
+    )
+    assert (
+        pipeline.heading_kind(
+            "B. Add a new Part II. Appendix F to Part 23--Test Procedure Part I--Acceptable "
+            "Test Procedure for Self-Extinguishing Materials for Showing Compliance With "
+            "Sec. Sec. 23.853, 23.855, and 23.1359* * * * * *Part II--Test Method To "
+            "Determine the Flammability and Flame Propagation Characteristics of "
+            "Thermal/Acoustic Insulation"
+        )
+        == "annex"
+    )
+    assert (
+        pipeline.heading_kind(
+            "B. Add a new Part III. Appendix F to Part 23--Test Method To Determine "
+            "the Flammability"
+        )
+        == "annex"
+    )
+
+
+def test_heading_kind_fr_amended_section_stays_clause() -> None:
+    # 未改写附录的普通 FAR 修订节头仍应判 clause（不要因新增边界规则破坏既有分类）。
+    assert pipeline.heading_kind("Sec. 23.1587 Performance information.") == "clause"
+    assert pipeline.heading_kind("Sec. 23.856 Thermal/acoustic insulation materials.") == "clause"
+    assert pipeline.heading_kind("Sec. 23.629 Flutter.") == "clause"
+
+
+def test_heading_kind_fr_appendix_not_misclassified_as_clause_or_chapter() -> None:
+    # "63. Amend…" / "A. Redesignate…" 这类数字/字母改订行不得落入 clause/chapter。
+    assert pipeline.heading_kind("63. Amend Appendix F to Part 23 as follows:") != "clause"
+    assert pipeline.heading_kind("A. Redesignate the existing text as Part I") != "clause"
+
+
+def test_heading_kind_section_reference_prose_is_not_heading() -> None:
+    # 联邦公报"前言讨论"段落以"Section 23.NNN … + 动词"开头，是正文引用、不是
+    # 条款标题。此前被当成 clause 会把几十个讨论段落挂到同一"整句标题"下并给
+    # 伪 article_id（23.571(D)/23.1309(D)），导致前言被当成条款索引（Q3 答到
+    # §23.1309 的根源）。
+    assert (
+        pipeline.heading_kind(
+            "Section 23.571(d) still requires the damage tolerance option under Sec. 23.573 "
+            "to be used on airplanes that exceed 41,000 feet."
+        )
+        is None
+    )
+    assert (
+        pipeline.heading_kind(
+            "Section 23.1309(d) also specifies that the design of systems and controls, "
+            "including indications and annunciations"
+        )
+        is None
+    )
+    assert pipeline.heading_kind(
+        "Section 23.1309(a)(2) does not mandate that non-required equipment and systems "
+        "function properly"
+    ) is None
+    # 真标题（简称 Sec. + 短标题）不受影响。
+    assert pipeline.heading_kind("Sec. 23.856 Thermal/acoustic insulation materials.") == "clause"
+    assert pipeline.heading_kind("Sec. 23.1587 Performance information.") == "clause"
+    assert pipeline.heading_kind("Sec. 23.629 Flutter.") == "clause"
+
+
+
 def test_unnumbered_subheading_rejects_body_fragments() -> None:
     # 正文碎片（pypdf 拆行产生）不得当作无编号子标题编号成 0.4.x。
     for frag in ("给出了", "应关系见", "对应关系见", "本标准采用", "本标准使组织能够"):
@@ -1991,3 +2515,40 @@ def test_unnumbered_subheading_rejects_body_fragments() -> None:
     # 真实无编号子标题（名词短语）不受影响。
     for title in ("基本要求", "试验要求", "田间布置", "监测内容", "可见光相机的指标要求如下"):
         assert pipeline._looks_like_unnumbered_subheading(title) is True
+
+
+def test_cross_page_merge_treats_footnote_numbered_header_as_new_table() -> None:
+    pages = [
+        pipeline.PageRecord(
+            page_number=10,
+            raw_text="",
+            rich_blocks=[{
+                "block_type": "table",
+                "table_rows": [
+                    ["Parameters", "Range", "Installed System1 accuracy", "Sampling", "Resolution"],
+                    ["Old parameter", "Full Range", "±3%", "1", "1%"],
+                ],
+            }],
+        ),
+        pipeline.PageRecord(
+            page_number=11,
+            raw_text="",
+            rich_blocks=[{
+                "block_type": "table",
+                "table_rows": [
+                    ["Parameters", "Range", "Installed System1 accuracy", "Sampling", "Resolution"],
+                    ["New parameter", "24 Hrs", "±0.125%", "0.25", "1 sec"],
+                ],
+            }],
+        ),
+    ]
+
+    diagnostics = pipeline.merge_cross_page_tables(pages, "footnote-header")
+    tables = [
+        block for block in pipeline.split_blocks("footnote-header", pages)
+        if block.block_type == "table"
+    ]
+    assert diagnostics["cross_page_table_count"] == 0
+    assert len(tables) == 2
+    assert tables[0].table_rows[1][0] == "Old parameter"
+    assert tables[1].table_rows[1][0] == "New parameter"

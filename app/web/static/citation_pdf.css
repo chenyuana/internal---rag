@@ -1,0 +1,16 @@
+.citation-pdf-dialog { width: min(1200px, 94vw); height: 90vh; padding: 18px; border: 1px solid #d5ded7; border-radius: 14px; background: #fffefa; }
+.citation-pdf-dialog[open] { display: flex; flex-direction: column; gap: 10px; }
+.citation-pdf-dialog::backdrop { background: #10221999; }
+.citation-pdf-head { display: flex; align-items: center; gap: 16px; }
+.citation-pdf-head h2 { flex: 1; margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.citation-pdf-head a { color: #176b4b; font-size: 12px; }
+#citationPdfStatus { margin: 0; font-size: 12px; color: #53645b; }
+#citationPdfFrame { flex: 1; width: 100%; min-height: 0; border: 1px solid #d5ded7; background: #eee; }
+#citationPdfFrame[hidden] { display: none; }
+.citation-pdf-quote { font-size: 12px; max-height: 22vh; overflow: auto; }
+.citation-pdf-quote p { white-space: pre-wrap; overflow-wrap: anywhere; }
+#citationPdfCanvasHost { flex: 1; min-height: 0; overflow: auto; background: #e6e8e7; text-align: center; padding: 12px 0; }
+#citationPdfCanvasHost canvas { display: block; margin: 0 auto; background: white; box-shadow: 0 2px 8px #0002; }
+#citationPdfPages:not([hidden]) { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; }
+#citationPdfPageNumber { width: 70px; }
+#citationPdfPages button { padding: 5px 10px; cursor: pointer; }

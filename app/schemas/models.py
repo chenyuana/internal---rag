@@ -12,6 +12,7 @@ class AnswerModelSelection(BaseModel):
 
     source_id: str = Field(min_length=1, max_length=100)
     model_name: str = Field(min_length=1, max_length=200)
+    thinking: bool | None = None
 
 
 class AnswerModelSource(BaseModel):

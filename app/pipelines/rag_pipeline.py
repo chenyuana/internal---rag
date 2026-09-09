@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable, Iterable
 from typing import cast
@@ -51,6 +52,7 @@ from app.services.model_client import OpenAICompatibleModelClient
 from app.services.multi_document import multi_document_groups
 from app.services.reference_document import build_auxiliary_evidence
 from app.services.regulation_answer_builder import RegulationAnswerBuilder
+from app.services.regulation_context import amendment_scope_note
 from app.services.retrieval_service import RetrievalExecution, RetrievalService
 from app.services.scope_validator import ScopeConsistencyValidator
 from app.services.subject_grounding_validator import SubjectGroundingValidator
@@ -140,6 +142,9 @@ class RagPipeline:
         )
         if request.reference_document is not None:
             self._attach_auxiliary_document(execution, request.reference_document)
+        execution.selected_chunks = self._scope_selector.select(
+            execution.query, execution.selected_chunks,
+        )
         assessment = self._judge.assess(
             execution.query,
             execution.selected_chunks,
@@ -222,10 +227,27 @@ class RagPipeline:
             execution.query,
             generation_chunks,
         )
+        mode = self._settings.generation.answer_mode
+        # Source-faithful Chinese rendering for foreign-language evidence. The
+        # existing generation validators still run; deterministic extraction
+        # remains available if generation cannot be validated.
+        if (
+            mode == "deterministic" and not is_matrix_first and generator is not None
+            and self._settings.generation.cross_language_generation
+            and re.search(r"[\u4e00-\u9fff]", request.query)
+            and generation_chunks
+        ):
+            body = "\n".join(c.text for c in generation_chunks)
+            if len(re.findall(r"[A-Za-z]", body)) > 4 * len(re.findall(
+                r"[\u4e00-\u9fff]", body,
+            )):
+                mode = "llm"
+                execution.stage_counts["cross_language_generation"] = 1
         matrix_fallback_applied = False
         matrix_first_applied = False
         generation: GenerationResult | None = None
-        if is_matrix_first and execution.query_plan is not None:
+        deterministic_answer: StructuredAnswer | None = None
+        if mode != "llm" and is_matrix_first and execution.query_plan is not None:
             matrix_generation = await self._comparison_orchestrator.run(
                 plan=execution.query_plan,
                 chunks=execution.selected_chunks,
@@ -257,14 +279,17 @@ class RagPipeline:
                     coverage_matrix=execution.coverage_matrix,
                     assessment=assessment,
                 )
-                generation = matrix_generation
-                matrix_first_applied = True
+                if mode == "deterministic":
+                    generation = matrix_generation
+                    matrix_first_applied = True
+                else:
+                    deterministic_answer = matrix_generation.answer
             else:
                 # 矩阵构建失败（plan 条件不满足等）：降级到 extractive /
                 # generator 兜底，**不抛 500**，保证问答始终可用。
                 execution.stage_counts["matrix_build_failed"] = 1
                 matrix_fallback_applied = True
-        if generation is None and extractive_answer is not None:
+        if mode != "llm" and generation is None and extractive_answer is not None:
             # Deterministic regulation answers may intentionally cover every
             # selected process chapter.  The model-oriented EvidenceExtractor
             # applies a global sentence budget, so a valid later chapter (for
@@ -278,10 +303,13 @@ class RagPipeline:
                 execution=execution,
                 include_historical=request.filters.include_historical,
             )
-            generation = GenerationResult(
-                answer=extractive_answer,
-                repaired=False,
-            )
+            if mode == "deterministic":
+                generation = GenerationResult(
+                    answer=extractive_answer,
+                    repaired=False,
+                )
+            else:
+                deterministic_answer = deterministic_answer or extractive_answer
         if generation is None:
             assert generator is not None
             try:
@@ -338,11 +366,14 @@ class RagPipeline:
                 else:
                     generation = fallback
                 matrix_fallback_applied = True
+        if mode == "hybrid" and deterministic_answer is not None and not matrix_fallback_applied:
+            generation = self._hybrid_merge(generation, deterministic_answer)
         # 对比矩阵兜底：生成模型答不出完整矩阵（缺已覆盖格子或整体降级）时，
         # 用确定性逐格填充的矩阵替换——按证据逐格给内容（无内容写"未明确
         # 说明"），稳定输出完整矩阵，不依赖 9B 模型能力。
         if (
             self._enforce_comparison_completeness
+            and mode != "hybrid"
             and execution.query_plan is not None
             and execution.query_plan.query_type in {"comparison", "multi_hop"}
             and not matrix_fallback_applied
@@ -367,10 +398,38 @@ class RagPipeline:
             )
             if fallback is not None:
                 generation = fallback
+        if (
+            mode == "deterministic"
+            and matrix_first_applied
+            and self._settings.generation.explain_enabled
+            and generator is not None
+            and generation is not None
+        ):
+            explanation = await generator.explain(generation.answer.answer)
+            if explanation:
+                merged = generation.answer.model_copy(
+                    update={
+                        "answer": (
+                            generation.answer.answer
+                            + "\n\n---\n通俗讲解（模型转述，依据见上文原文）：\n"
+                            + explanation
+                        )
+                    }
+                )
+                generation = GenerationResult(
+                    answer=merged,
+                    repaired=generation.repaired,
+                    validation_degraded=generation.validation_degraded,
+                    validation_warnings=generation.validation_warnings,
+                    model_calls=generation.model_calls + 1,
+                )
         execution.model_call_counts[
             "summary" if matrix_first_applied else "answer"
         ] = generation.model_calls
         answer = generation.answer
+        scope_note = amendment_scope_note(generation_chunks)
+        if scope_note:
+            answer = answer.model_copy(update={"answer": answer.answer + "\n\n" + scope_note})
         used_citations = set(CITATION_MARKER.findall(answer.answer))
         used_citations.update(
             citation_id for claim in answer.claims for citation_id in claim.citation_ids
@@ -956,6 +1015,55 @@ class RagPipeline:
         )
 
     @staticmethod
+    def _hybrid_merge(
+        primary: GenerationResult, backup: StructuredAnswer | None,
+    ) -> GenerationResult:
+        """LLM 为主、确定性答案为补：把 LLM 未引用的证据条款补回答案。
+
+        保证企业知识库"不漏条款"：确定性矩阵/提取式答案覆盖全部相关引用，
+        LLM 生成时可能精简掉部分（如对比矩阵中的林木高度/郁闭度等上下文），
+        这里按引用编号补回，避免证据丢失。
+        """
+        if backup is None or not backup.claims:
+            return primary
+        covered = {
+            citation_id
+            for claim in primary.answer.claims
+            for citation_id in claim.citation_ids
+        }
+        missing = [
+            claim
+            for claim in backup.claims
+            if not (set(claim.citation_ids) & covered)
+        ]
+        if not missing:
+            return primary
+        lines = [primary.answer.answer, "", "---", "补充（证据范围内、上文未列出的条款）："]
+        appended: list[CandidateClaim] = []
+        for index, claim in enumerate(missing, start=1):
+            lines.append(f"{claim.claim} [{', '.join(claim.citation_ids)}]")
+            appended.append(
+                CandidateClaim(
+                    claim_id=f"supplement-{index}",
+                    claim=claim.claim,
+                    citation_ids=claim.citation_ids,
+                )
+            )
+        merged = primary.answer.model_copy(
+            update={
+                "answer": "\n\n".join(lines),
+                "claims": [*primary.answer.claims, *appended],
+            }
+        )
+        return GenerationResult(
+            answer=merged,
+            repaired=primary.repaired,
+            validation_degraded=primary.validation_degraded,
+            validation_warnings=primary.validation_warnings,
+            model_calls=primary.model_calls,
+        )
+
+    @staticmethod
     def _validate_answerability(
         assessment: EvidenceAssessment,
         answer: StructuredAnswer,
@@ -964,7 +1072,12 @@ class RagPipeline:
             assessment.status == "PARTIALLY_ANSWERABLE"
             and answer.answerability == "ANSWERABLE"
         ):
-            raise ValueError("the model cannot upgrade partial evidence to ANSWERABLE")
+            # Enterprise knowledge base: answers must be grounded in the retrieved
+            # evidence and must never over-claim completeness on partial evidence.
+            # Instead of failing the whole request (500), downgrade answerability
+            # honestly. Claim-level grounding validators still strip any content not
+            # backed by a citation.
+            answer.answerability = "PARTIALLY_ANSWERABLE"
         # 不再要求模型把 judge 判定缺失的要求逐条写进 missing_information：
         # 响应层会把 assessment.missing_requirements 确定性合并进响应的
         # missing_information，模型漏填只会徒增修复轮次、引发答案震荡。

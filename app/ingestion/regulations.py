@@ -33,6 +33,11 @@ _BARE_ARTICLE_RE = re.compile(
     rf")(?P<tail>(?:\s*[（(]\s*{_LEVEL_TOKEN}\s*[）)])*)",
     re.IGNORECASE,
 )
+_SECTION_ARTICLE_RE = re.compile(
+    r"(?:§|Sec(?:tion)?\.?)\s*(?P<base>\d+\.\d+)"
+    r"(?P<tail>(?:\s*\([A-Za-z0-9]+\))*)",
+    re.IGNORECASE,
+)
 _WRAPPED_LEVEL_RE = re.compile(rf"[（(]\s*(?P<value>{_LEVEL_TOKEN})\s*[）)]")
 _LABELED_LEVEL_RE = re.compile(
     rf"第?\s*(?P<value>{_LEVEL_TOKEN})\s*(?:款|项|目)",
@@ -150,6 +155,15 @@ def extract_article_references(text: str) -> list[ArticleReference]:
 def match_article_heading(text: str) -> ArticleReference | None:
     """Return an article only when the identifier starts the logical line."""
     normalized = _normalized_text(text)
+    section = _SECTION_ARTICLE_RE.match(normalized)
+    if section is not None and normalized[section.end():].strip():
+        remainder = normalized[section.end():].lstrip(" .:—–-")
+        if re.match(
+            r"(?:as|is|are|was|were|would|should|must|requires?|applies|has|had|"
+            r"by|to|and|of|in|for|the)\b", remainder, re.I,
+        ):
+            return None
+        return _reference(section)
     marked = _MARKED_ARTICLE_RE.match(normalized)
     if marked is not None:
         return _reference(marked)

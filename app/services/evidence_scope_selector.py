@@ -5,6 +5,7 @@ import unicodedata
 
 from app.ingestion.regulations import extract_article_references
 from app.schemas.retrieval import NormalizedQuery, SelectedChunk
+from app.services.article_identity import owns_requested_article
 
 _LEADING_DOC_RE = re.compile(r"^文档：\s*(.+)$", re.MULTILINE)
 _LEADING_SECTION_RE = re.compile(r"^章节：\s*(.+)$", re.MULTILINE)
@@ -64,6 +65,12 @@ class EvidenceScopeSelector:
             reference.normalized_id
             for reference in extract_article_references(query.original_query)
         }
+        if declared_articles:
+            # Keep every requested section and its descendants. Never choose
+            # just one anchor for a multi-section question or choose a version
+            # merely because its chunk happened to rank first.
+            scoped = [c for c in chunks if owns_requested_article(c, list(declared_articles))]
+            return scoped or chunks
         query_text = _normalized_text(query.original_query)
         anchors: list[tuple[int, str, str]] = []
         for chunk in chunks:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -76,8 +76,7 @@ class RagflowPublication(BaseModel):
             self.stage = "published"
             self.percent = 100
             self.message = (
-                f"发布完成：新增 {self.published_chunk_count}，"
-                f"跳过 {self.skipped_chunk_count}"
+                f"发布完成：新增 {self.published_chunk_count}，跳过 {self.skipped_chunk_count}"
             )
         elif self.status == PublicationStatus.PUBLISHING:
             self.stage = "publishing_chunks" if self.document_id else "uploading_document"
@@ -110,6 +109,10 @@ class IngestionQualitySummary(BaseModel):
     failure_count: int = 0
 
 
+class IngestionPageReprocessRequest(BaseModel):
+    mode: Literal["clean", "ocr"] = "clean"
+
+
 class IngestionJob(BaseModel):
     job_id: str
     status: IngestionJobStatus
@@ -123,6 +126,9 @@ class IngestionJob(BaseModel):
     knowledge_base_id: str | None = None
     created_by: str
     original_path: str
+    # 该资料是否启用 LLM 智能结构清洗（章节/附录/条号识别）。默认关闭；开启时
+    # 解析后会对 chunk 的 section_path/article_id/title/keywords 做 LLM 语义重标注。
+    llm_structure_enabled: bool = False
     output_path: str | None = None
     progress: IngestionProgress = Field(default_factory=IngestionProgress)
     quality: IngestionQualitySummary = Field(default_factory=IngestionQualitySummary)
@@ -131,6 +137,7 @@ class IngestionJob(BaseModel):
     error_code: str | None = None
     error_message: str | None = None
     attempts: int = Field(default=0, ge=0)
+    page_reprocess: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -188,6 +195,7 @@ class IngestionPageDetail(BaseModel):
     assets: list[dict[str, Any]] = Field(default_factory=list)
     parser_trace: list[dict[str, Any]] = Field(default_factory=list)
     quality_gates: list[dict[str, Any]] = Field(default_factory=list)
+    page_reprocess: dict[str, Any] = Field(default_factory=dict)
     source_url: str
 
 
@@ -245,6 +253,10 @@ class IngestionQueueStatus(BaseModel):
 class IngestionPublishRequest(BaseModel):
     dataset_id: str | None = None
     dry_run: bool = True
+
+
+class IngestionExportRequest(BaseModel):
+    job_ids: list[str]
 
 
 class RagflowPublishPlan(BaseModel):

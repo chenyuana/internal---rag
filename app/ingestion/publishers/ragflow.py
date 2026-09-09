@@ -106,7 +106,7 @@ class RagflowPublisher:
                 if str(value).strip()
             ]
             title = str(raw_chunk.get("title", "")).strip()
-            article_id = str(raw_chunk.get("article_id_normalized", "")).strip()
+            article_id = str(raw_chunk.get("article_id_normalized") or "").strip()
             article_aliases = [
                 str(value).strip()
                 for value in raw_chunk.get("article_aliases", [])
@@ -178,6 +178,9 @@ class RagflowPublisher:
             elif str(raw_chunk.get("content_type", "")).strip().casefold() == "figure":
                 tags.append("content_type:figure")
             tags.extend(f"table_id:{table_id}" for table_id in table_ids)
+            for related in raw_chunk.get("related_chunks", []):
+                if isinstance(related, dict) and related.get("chunk_id"):
+                    tags.append(f"related_chunk_id:{related['chunk_id']}")
             # Raw LaTeX is NOT put into tag_kwd: every formula would be a
             # unique high-cardinality tag and the backslashes/braces risk
             # breaking tag parsing. Instead emit finite enum tags here and

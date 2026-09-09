@@ -8,6 +8,7 @@ const state = {
   publishingJobId: null,
   selectedPublishJobIds: new Set(),
   batchPublishing: false,
+  batchExporting: false,
   batchProgress: { current: 0, total: 0, message: "" },
   jobView: "unreviewed",
   deletingJobId: null,
@@ -19,6 +20,8 @@ const state = {
   currentPageDetail: null,
   editingChunkId: null,
   savingChunk: false,
+  exportingJobId: null,
+  savingLlmStructureSettings: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -124,6 +127,66 @@ async function requestJson(url, options = {}) {
 function setMessage(target, message, isError = false) {
   target.textContent = message;
   target.classList.toggle("error", isError);
+}
+
+function renderLlmStructureSettings(settings) {
+  $("llmStructureBaseUrl").value = settings.base_url || "https://api.deepseek.com/v1";
+  $("llmStructureModel").value = settings.model || "deepseek-v4-flash";
+  $("llmStructurePageBatchSize").value = settings.page_batch_size || 3;
+  $("llmStructureMaxTokens").value = settings.max_tokens || 2048;
+  $("llmStructureTimeout").value = settings.timeout_seconds || 180;
+  $("llmStructureApiKey").value = "";
+  $("llmStructureKeyStatus").textContent = settings.api_key_configured
+    ? `API Key 已配置（尾号 ${settings.api_key_last4 || "****"}）`
+    : "尚未配置 API Key";
+}
+
+async function loadLlmStructureSettings() {
+  try {
+    const settings = await requestJson(`${API}/settings/llm-structure`, {
+      headers: { "X-User-ID": "local-operator" },
+    });
+    renderLlmStructureSettings(settings);
+  } catch (error) {
+    setMessage($("llmStructureMessage"), `模型配置加载失败：${error.message}`, true);
+  }
+}
+
+async function saveLlmStructureSettings() {
+  if (state.savingLlmStructureSettings) return;
+  const payload = {
+    base_url: $("llmStructureBaseUrl").value.trim(),
+    model: $("llmStructureModel").value.trim(),
+    page_batch_size: Number($("llmStructurePageBatchSize").value),
+    max_tokens: Number($("llmStructureMaxTokens").value),
+    timeout_seconds: Number($("llmStructureTimeout").value),
+  };
+  const apiKey = $("llmStructureApiKey").value.trim();
+  if (apiKey) payload.api_key = apiKey;
+  if (!payload.base_url || !payload.model) {
+    setMessage($("llmStructureMessage"), "请填写接口地址和模型名称。", true);
+    return;
+  }
+  state.savingLlmStructureSettings = true;
+  $("saveLlmStructureSettings").disabled = true;
+  setMessage($("llmStructureMessage"), "正在保存模型配置…");
+  try {
+    const settings = await requestJson(`${API}/settings/llm-structure`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-User-ID": "local-operator",
+      },
+      body: JSON.stringify(payload),
+    });
+    renderLlmStructureSettings(settings);
+    setMessage($("llmStructureMessage"), "模型配置已保存；服务重启后需要重新配置 API Key。");
+  } catch (error) {
+    setMessage($("llmStructureMessage"), error.message, true);
+  } finally {
+    state.savingLlmStructureSettings = false;
+    $("saveLlmStructureSettings").disabled = false;
+  }
 }
 
 function formatBytes(value) {
@@ -256,6 +319,7 @@ async function uploadFiles() {
     const relativePath = fileRelativePath(file);
     if (relativePath) form.append("source_relative_path", relativePath);
     if (datasetId) form.append("knowledge_base_id", datasetId);
+    form.append("llm_structure_enabled", String($("llmStructureEnabled").checked));
     form.append("batch_id", batchId);
     form.append("sequence_in_batch", String(index));
     try {
@@ -489,13 +553,18 @@ function updateBatchControls() {
   const selectedCount = state.selectedPublishJobIds.size;
   $("batchToolbar").hidden = state.jobView !== "approved";
   const selectAll = $("selectAllApproved");
-  selectAll.disabled = state.batchPublishing || eligible.length === 0;
+  const batchBusy = state.batchPublishing || state.batchExporting;
+  selectAll.disabled = batchBusy || eligible.length === 0;
   selectAll.checked = eligible.length > 0 && selectedCount === eligible.length;
   selectAll.indeterminate = selectedCount > 0 && selectedCount < eligible.length;
-  $("batchPublishButton").disabled = state.batchPublishing || selectedCount === 0;
+  $("batchPublishButton").disabled = batchBusy || selectedCount === 0;
   $("batchPublishButton").textContent = state.batchPublishing
     ? "正在批量发送"
     : `批量发送${selectedCount ? `（${selectedCount}）` : ""}`;
+  $("batchExportButton").disabled = batchBusy || selectedCount === 0;
+  $("batchExportButton").textContent = state.batchExporting
+    ? "正在批量导出"
+    : `批量导出${selectedCount ? `（${selectedCount}）` : ""}`;
 
   const panel = $("batchPublishProgress");
   panel.hidden = !state.batchPublishing && state.batchProgress.total === 0;
@@ -620,7 +689,7 @@ function renderQuality(job, preview) {
       )
       .join("") || '<div class="empty-state">处理完成后显示质量门禁。</div>';
 
-  renderPageDiagnostics(preview?.pages || []);
+  renderPageDiagnostics(preview?.pages || [], preview?.quality || {});
 
   const chunks = preview?.chunks || [];
   $("chunkPreview").innerHTML =
@@ -643,21 +712,49 @@ function renderQuality(job, preview) {
       .join("") || '<div class="empty-state">暂无可预览 Chunk。</div>';
 }
 
-function pageRouteTone(page) {
+function pageQualityTones(quality) {
+  const tones = new Map();
+  const rank = { warning: 1, failed: 2 };
+  (quality?.quality_gates || []).forEach((gate) => {
+    if (!['warn', 'fail'].includes(gate.status)) return;
+    const tone = gate.status === 'fail' ? 'failed' : 'warning';
+    const pageNumbers = new Set(
+      (Array.isArray(gate.pages) ? gate.pages : []).map(Number).filter(Number.isInteger),
+    );
+    for (const match of String(gate.message || '').matchAll(/\[([\d,\s]+)\]/g)) {
+      match[1]
+        .split(',')
+        .map((value) => Number(value.trim()))
+        .filter(Number.isInteger)
+        .forEach((pageNumber) => pageNumbers.add(pageNumber));
+    }
+    pageNumbers.forEach((pageNumber) => {
+      const current = tones.get(pageNumber);
+      if (!current || rank[tone] > rank[current]) tones.set(pageNumber, tone);
+    });
+  });
+  return tones;
+}
+
+function pageRouteTone(page, qualityTones = new Map()) {
   const route = String(page.route || "");
   if (route === "toc_excluded" || page.indexable === false) return "excluded";
+  if (qualityTones.has(Number(page.page_number))) {
+    return qualityTones.get(Number(page.page_number));
+  }
   if (route === "vector_layout" || route === "remote_layout") return "ready";
   if (route.includes("ocr_required") || route.includes("low_text")) return "failed";
   if (route.includes("review") || route.includes("layout")) return "warning";
   return "ready";
 }
 
-function renderPageDiagnostics(pages) {
+function renderPageDiagnostics(pages, quality) {
   const container = $("pageDiagnostics");
+  const qualityTones = pageQualityTones(quality);
   state.previewPages = pages;
   state.firstIssuePage =
-    pages.find((page) => pageRouteTone(page) === "failed") ||
-    pages.find((page) => pageRouteTone(page) === "warning") ||
+    pages.find((page) => pageRouteTone(page, qualityTones) === "failed") ||
+    pages.find((page) => pageRouteTone(page, qualityTones) === "warning") ||
     null;
   const issueButton = $("firstIssuePageButton");
   issueButton.hidden = !state.firstIssuePage;
@@ -684,7 +781,7 @@ function renderPageDiagnostics(pages) {
       ].filter(Boolean);
       return `
         <button
-          class="page-diagnostic ${pageRouteTone(page)}"
+          class="page-diagnostic ${pageRouteTone(page, qualityTones)}"
           type="button"
           data-page-number="${escapeHtml(page.page_number)}"
           title="查看第 ${escapeHtml(page.page_number)} 页解析详情"
@@ -1155,7 +1252,8 @@ async function selectJob(jobId) {
   $("detailCard").hidden = false;
   $("detailTitle").textContent = job.source_name;
   $("detailMeta").textContent =
-    `${job.job_id.slice(0, 12)} · ${job.knowledge_base_id || "未指定目标知识库"}`;
+    `${job.job_id.slice(0, 12)} · ${job.knowledge_base_id || "未指定目标知识库"}` +
+    (job.llm_structure_enabled ? " · LLM 结构增强" : " · 原生结构解析");
   $("detailStatus").textContent = statusNames[job.status] || job.status;
   $("detailStatus").className = `status-badge ${job.status}`;
   renderProgress(job);
@@ -1172,6 +1270,7 @@ async function selectJob(jobId) {
   $("retryButton").disabled = !canRetry;
   $("dryRunButton").disabled = !canPlan;
   $("publishButton").disabled = !canPublish;
+  $("exportButton").disabled = Boolean(state.exportingJobId) || !["completed", "warning", "needs_review"].includes(job.status);
   $("publishButton").textContent =
     job.publication?.status === "failed" ? "重新发送到知识库" : "发布到测试知识库";
   $("publishButton").title = canPublish
@@ -1325,6 +1424,78 @@ async function deleteJob(jobId) {
   }
 }
 
+async function exportSelected() {
+  if (!state.selectedJobId || state.exportingJobId) return;
+  const job = state.jobs.find((item) => item.job_id === state.selectedJobId);
+  if (!job || !["completed", "warning", "needs_review"].includes(job.status)) return;
+
+  state.exportingJobId = job.job_id;
+  $("exportButton").disabled = true;
+  setMessage($("detailMessage"), "正在生成处理结果导出包…");
+  try {
+    const response = await fetch(`${API}/jobs/${job.job_id}/export?format=zip`);
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.detail || payload?.error?.message || `导出失败（HTTP ${response.status}）`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("content-disposition") || "";
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    const filename = match?.[1] || `${job.source_name.replace(/\.[^.]+$/, "")}-cleaned.zip`;
+    downloadBlob(blob, filename);
+    setMessage($("detailMessage"), `已导出处理结果：${filename}`);
+  } catch (error) {
+    setMessage($("detailMessage"), error.message, true);
+  } finally {
+    state.exportingJobId = null;
+    $("exportButton").disabled = false;
+  }
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function batchExportSelected() {
+  if (state.batchPublishing || state.batchExporting || !state.selectedPublishJobIds.size) return;
+  const jobIds = state.jobs
+    .filter((job) => state.selectedPublishJobIds.has(job.job_id) && isPublishable(job))
+    .map((job) => job.job_id);
+  if (!jobIds.length) return;
+
+  state.batchExporting = true;
+  updateBatchControls();
+  setMessage($("formMessage"), `正在打包 ${jobIds.length} 份处理结果…`);
+  try {
+    const response = await fetch(`${API}/jobs/export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_ids: jobIds }),
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.detail || payload?.error?.message || `批量导出失败（HTTP ${response.status}）`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("content-disposition") || "";
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    const filename = match?.[1] || "cleaned-export.zip";
+    downloadBlob(blob, filename);
+    setMessage($("formMessage"), `已导出 ${jobIds.length} 份处理结果：${filename}`);
+  } catch (error) {
+    setMessage($("formMessage"), error.message, true);
+  } finally {
+    state.batchExporting = false;
+    updateBatchControls();
+  }
+}
 async function publishSelected(dryRun) {
   if (!state.selectedJobId || state.publishingJobId) return;
   const job = state.jobs.find((item) => item.job_id === state.selectedJobId);
@@ -1463,6 +1634,7 @@ function initializeEvents() {
   $("selectFilesButton").addEventListener("click", () => $("fileInput").click());
   $("selectFolderButton").addEventListener("click", () => $("folderInput").click());
   $("uploadButton").addEventListener("click", uploadFiles);
+  $("saveLlmStructureSettings").addEventListener("click", saveLlmStructureSettings);
   $("refreshButton").addEventListener("click", manualRefresh);
   $("jobSearchInput").addEventListener("input", (event) => {
     state.jobQuery = event.target.value;
@@ -1479,7 +1651,9 @@ function initializeEvents() {
   $("retryButton").addEventListener("click", retrySelected);
   $("dryRunButton").addEventListener("click", () => publishSelected(true));
   $("publishButton").addEventListener("click", () => publishSelected(false));
+  $("exportButton").addEventListener("click", exportSelected);
   $("batchPublishButton").addEventListener("click", batchPublishSelected);
+  $("batchExportButton").addEventListener("click", batchExportSelected);
   $("previousReviewButton").addEventListener("click", () => navigateReview(-1));
   $("nextReviewButton").addEventListener("click", () => navigateReview(1));
   $("saveReviewNextButton").addEventListener("click", () =>
@@ -1547,7 +1721,7 @@ function initializeEvents() {
 async function boot() {
   initializeEvents();
   updateFileSelection();
-  await Promise.all([refreshServices(), refreshAll()]);
+  await Promise.all([refreshServices(), refreshAll(), loadLlmStructureSettings()]);
   window.setInterval(refreshAll, 3000);
   window.setInterval(refreshServices, 15000);
 }

@@ -14,11 +14,25 @@ from app.core.config import PROJECT_ROOT, TranslationSettings
 from app.core.exceptions import AppError
 from app.schemas.planning import PlannedCell, TranslationDecision
 from app.schemas.retrieval import NormalizedQuery
+from app.services.domain_terms import english_expansion
 from app.services.evidence_text import lexical_units
 from app.services.requirement_taxonomy import ASPECT_RETRIEVAL_TERMS
 from app.services.structured_planner_model import PROTECTED_TOKEN_RE
 
 NUMBER_RE = re.compile(r"(?<![A-Za-z])\d+(?:\.\d+)*(?:\s*[A-Za-z%℃]+)?")
+
+
+def has_translatable_topic(query: NormalizedQuery) -> bool:
+    """An identifier-only lookup needs no translation; a mixed topic query does."""
+    text = PROTECTED_TOKEN_RE.sub(" ", query.original_query)
+    for token in sorted(query.exact_tokens, key=len, reverse=True):
+        text = text.replace(token, " ")
+    text = re.sub(
+        r"(?:第|条|款|项|请问|请|关于|的|内容|规定|要求|是什么|有哪些|是多少|"
+        r"什么|多少|如何|解释|说明|查询|查找|what|is|the|section|requirements?)", " ", text,
+        flags=re.I,
+    )
+    return bool(re.search(r"[\u4e00-\u9fff]{2,}", text))
 
 
 class TranslationModel(Protocol):
@@ -58,13 +72,18 @@ class QueryTranslator:
         started = time.perf_counter()
         if not self._settings.enabled or self._settings.max_variants_per_cell == 0:
             return self._disabled(started, "translation_disabled")
-        if query.article_ids or query.exact_tokens:
+        if (query.article_ids or query.exact_tokens) and not has_translatable_topic(query):
             return self._disabled(started, "exact_query_translation_forbidden")
         if not self._settings.model_enabled or self._model is None:
-            terms = ASPECT_RETRIEVAL_TERMS.get(cell.aspect)
+            terms = (
+                ASPECT_RETRIEVAL_TERMS.get(cell.aspect) or english_expansion(cell.original_query)
+            )
             if not terms:
                 return self._disabled(started, "translation_model_unavailable")
-            translated = f"{cell.subject or ''} {cell.aspect} {terms}".strip()
+            parts = dict.fromkeys([cell.original_query, cell.subject or "", cell.aspect, terms])
+            translated = " ".join(part for part in parts if part)
+            if len(translated) > 500:
+                return self._disabled(started, "translation_query_too_long")
             return TranslationOutcome(
                 decision=TranslationDecision(
                     should_translate=True,
@@ -81,6 +100,7 @@ class QueryTranslator:
             "aspect": cell.aspect,
             "original_query": cell.original_query,
             "initial_section_titles": section_titles[:5],
+            "protected_identifiers": query.exact_tokens,
         }
         try:
             raw = await asyncio.wait_for(
@@ -140,6 +160,8 @@ class QueryTranslator:
         invented_numbers = set(NUMBER_RE.findall(translated)) - set(NUMBER_RE.findall(allowed))
         if invented_tokens or invented_numbers:
             raise ValueError("translated query invented protected tokens or numbers")
+        if any(token not in translated for token in query.exact_tokens):
+            raise ValueError("translated query removed a protected identifier")
 
     @staticmethod
     def _parse_json(raw: str) -> Any:

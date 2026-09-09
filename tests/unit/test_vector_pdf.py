@@ -13,6 +13,33 @@ from app.ingestion.pipeline import (
 )
 
 
+def test_has_body_vector_content_ignores_running_header_margin_strokes() -> None:
+    from types import SimpleNamespace
+
+    def el(top, bottom):
+        return SimpleNamespace(top=top, bottom=bottom, x0=0, x1=10)
+
+    # Only running-header/footer margin strokes (a blank spacer page) are NOT
+    # figure content.
+    margin_only = SimpleNamespace(
+        height=800,
+        rects=[el(19, 25), el(760, 766)],
+        curves=[el(775, 780)],
+        lines=[el(20, 24)],
+    )
+    assert VectorPdfParser._has_body_vector_content(margin_only) is False
+
+    # A real diagram occupying the page body IS figure content.
+    body = SimpleNamespace(
+        height=800, rects=[el(200, 600)], curves=[el(250, 300)], lines=[]
+    )
+    assert VectorPdfParser._has_body_vector_content(body) is True
+
+    assert VectorPdfParser._has_body_vector_content(
+        SimpleNamespace(height=800, rects=[], curves=[], lines=[])
+    ) is False
+
+
 def test_preflight_routes_image_charts_and_vector_formulas(monkeypatch) -> None:
     class FakePage:
         width = 100
@@ -146,6 +173,203 @@ def test_preflight_flags_low_coverage_image_with_figure_caption(monkeypatch) -> 
     )
 
     assert result.figure_pages == {1}
+
+
+def test_preflight_flags_small_inline_figure_referenced_in_prose(monkeypatch) -> None:
+    """A graph introduced in prose must not need a conventional figure caption."""
+
+    class FakePage:
+        width = 100
+        height = 100
+        rects = []
+        lines = []
+        curves = []
+
+        def extract_text(self) -> str:
+            return (
+                "The system is subject to the applicable operating limits. " * 12
+                + "The parameter trend is shown in the following figure."
+            )
+
+        images = [{"x0": 10.0, "x1": 30.0, "top": 10.0, "bottom": 50.0}]
+
+    class FakePdf:
+        pages = [FakePage()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "app.ingestion.parsers.vector_pdf.pdfplumber.open",
+        lambda _path: FakePdf(),
+    )
+
+    result = VectorPdfParser().preflight_pages(
+        Path("inline-figure.pdf"), candidate_pages={1}
+    )
+
+    assert result.figure_pages == {1}
+
+
+def test_preflight_routes_native_page_raster_table_to_ocr(monkeypatch) -> None:
+    # A raster *table* embedded in an otherwise native-text page covers only a
+    # tiny fraction of the page (well under the 0.12 figure cut-off), so the
+    # coverage rules miss it entirely.  The PDF nevertheless tags the image as
+    # a structure ``Figure`` content item (pdfplumber ``image.tag``).  That
+    # structural marker is the deterministic signal that the raster carries
+    # real content (an FAA bird-ingestion table) whose cells live only in
+    # pixels, so it must route to remote OCR (``raster_table_pages``) — never to
+    # the figure path (which would keep only a cropped image with no rows).
+    class FakePage:
+        width = 100
+        height = 100
+        rects = []
+
+        def __init__(self, *, text: str, images: list[dict[str, object]]) -> None:
+            self._text = text
+            self.images = images
+            self.lines = []
+            self.curves = []
+
+        def extract_text(self) -> str:
+            return self._text
+
+    class FakePdf:
+        pages = [
+            FakePage(
+                text=(
+                    "As an example, the following quantities of birds ingested "
+                    "for engines in the 6,000 square-inch class are as follows:"
+                ),
+                images=[
+                    {
+                        # tiny relative to the 100x100 page (a few percent), so
+                        # it never trips the real figure coverage cut-offs.
+                        "x0": 34.5,
+                        "x1": 44.5,
+                        "top": 352.5,
+                        "bottom": 359.5,
+                        "srcsize": (100, 70),
+                        "stream": object(),
+                        "tag": "Figure",
+                    }
+                ],
+            ),
+            FakePage(
+                text="Untagged decorative logo page, no structured figure.",
+                images=[
+                    {
+                        "x0": 40.0,
+                        "x1": 60.0,
+                        "top": 10.0,
+                        "bottom": 30.0,
+                        "srcsize": (20, 20),
+                        "stream": object(),
+                        "tag": None,
+                    }
+                ],
+            ),
+            FakePage(
+                # High-coverage structurally-tagged Figure rasters with no
+                # figure caption / inline reference / flow chart are raster
+                # tables too (page 25 of 23-54-DRS_98-19 stacks TABLE 2 /
+                # TABLE 3 / the 33.77(e) grid at ~39% coverage). Coverage must
+                # not send them to the figure path.
+                text=(
+                    "Compliance with paragraph (c) of this section must be "
+                    "shown by engine test under the following ingestion "
+                    "conditions:"
+                ),
+                images=[
+                    {
+                        "x0": 10.0,
+                        "x1": 90.0,
+                        "top": 40.0,
+                        "bottom": 70.0,
+                        "srcsize": (600, 200),
+                        "stream": object(),
+                        "tag": "Figure",
+                    },
+                    {
+                        "x0": 10.0,
+                        "x1": 90.0,
+                        "top": 72.0,
+                        "bottom": 90.0,
+                        "srcsize": (600, 120),
+                        "stream": object(),
+                        "tag": "Figure",
+                    },
+                ],
+            ),
+        ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "app.ingestion.parsers.vector_pdf.pdfplumber.open",
+        lambda _path: FakePdf(),
+    )
+
+    result = VectorPdfParser().preflight_pages(
+        Path("native-raster-table.pdf"),
+        candidate_pages={1, 2, 3},
+    )
+
+    # Both structurally-tagged Figure pages route to OCR (the low-coverage page
+    # 1 and the high-coverage page 3), never to the figure path; the untagged
+    # decorative image is ignored entirely.
+    assert result.raster_table_pages == {1, 3}
+    assert result.figure_pages == set()
+    # Each raster table page also exposes its image bbox (0..1000 normalized)
+    # so the hybrid parser can crop and re-OCR the region at higher resolution.
+    assert set(result.raster_table_boxes) == {1, 3}
+    assert result.raster_table_boxes[1] == [[345.0, 3525.0, 445.0, 3595.0]]
+    assert result.raster_table_boxes[3] == [
+        [100.0, 400.0, 900.0, 700.0],
+        [100.0, 720.0, 900.0, 900.0],
+    ]
+
+
+def test_table_token_multiset_is_separator_and_fusion_insensitive() -> None:
+    from app.ingestion.parsers.hybrid_pdf import _table_token_multiset
+
+    # A crop that re-read the same content with different separators (en-dash vs
+    # hyphen) and split the fused "3 2" into "3" / "2" has the same multiset.
+    whole = [
+        ["Weight of bird", "Number of birds"],
+        ["1.0-1.5", ""],
+        ["1.5-2.5", "3"],
+        ["2.5+", "3 2"],
+    ]
+    crop = [
+        ["Weight of bird", "Number of birds"],
+        ["1.0–1.5", "3"],
+        ["1.5–2.5", "3"],
+        ["2.5+", "2"],
+    ]
+    assert _table_token_multiset(whole) == _table_token_multiset(crop)
+
+    # A crop that duplicates or drops a value differs and must be rejected.
+    duplicated = [
+        ["Weight of bird", "Number of birds"],
+        ["1.0–1.5", "3"],
+        ["1.5–2.5", "3"],
+        ["2.5+", "2 2"],
+    ]
+    assert _table_token_multiset(whole) != _table_token_multiset(duplicated)
+    dropped = [
+        ["Weight of bird", "Number of birds"],
+        ["1.0–1.5", "3"],
+        ["1.5–2.5", "3"],
+    ]
+    assert _table_token_multiset(whole) != _table_token_multiset(dropped)
 
 
 def test_preflight_detects_consecutive_ruled_table_pages(monkeypatch) -> None:
@@ -387,9 +611,26 @@ def test_valid_table_accepts_header_only_blank_record_form() -> None:
         ["", "", "", "", "", "", "", ""],
     ]
     assert VectorPdfParser._valid_table((bbox, rows)) is True
-    # 单列表（附录标题）仍应被拒绝
+    # 短单列表（附录标题）仍应被拒绝
     single = [["附录 B"], ["（资料性）"], ["航摄作业记录表"]]
     assert VectorPdfParser._valid_table((bbox, single)) is False
+
+
+def test_valid_table_accepts_wide_single_column_regulatory_table() -> None:
+    # 有些法规表格用一个宽幅外框和横线分行，列内的点引导符并不会成为
+    # PDF 的垂直表格线。不能因其只有一列抽取结果而降级成段落文字。
+    bbox = [36.0, 552.0, 560.0, 705.0]
+    rows = [
+        ["Motion and effect"],
+        [
+            "(1) Powerplant controls:\n* * * * *\n"
+            "Fuel..................................Forward for open."
+        ],
+    ]
+    assert VectorPdfParser._valid_table((bbox, rows)) is True
+
+    decorative = [["Appendix B"], ["Informative"]]
+    assert VectorPdfParser._valid_table(([70.0, 250.0, 540.0, 326.0], decorative)) is False
 
 
 def test_valid_table_accepts_single_row_multi_column_schematic() -> None:
@@ -2020,6 +2261,27 @@ def test_caption_near_single_symbol_legend_still_returned() -> None:
     assert parser._caption_near(page, bbox).startswith("a 起降过程")
 
 
+def test_continuation_grid_stops_at_first_segmented_row_boundary() -> None:
+    # A page can start with a wrapped row and then draw a complete one-row
+    # table. Cell-by-cell horizontal rules must close the continuation crop at
+    # the first boundary instead of swallowing the following row.
+    from types import SimpleNamespace
 
+    columns = [35.0, 210.0, 385.0, 560.0]
+    edges = [
+        {"x0": x, "x1": x, "top": 28.5, "bottom": 84.0}
+        for x in columns
+    ]
+    edges.extend(
+        {"x0": left, "x1": right, "top": 83.25, "bottom": 84.0}
+        for left, right in zip(columns, columns[1:], strict=False)
+    )
+    page = SimpleNamespace(edges=edges, height=842.0, width=595.0)
+
+    bbox = VectorPdfParser._continuation_grid(page, columns)
+
+    assert bbox is not None
+    assert bbox[1] == 28.5
+    assert 83.0 <= bbox[3] <= 84.5
 
 

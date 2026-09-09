@@ -52,12 +52,8 @@ def test_builds_verbatim_top_level_clauses_across_chunks() -> None:
     )
 
     assert answer is not None
-    assert [claim.claim_id for claim in answer.claims] == [
-        "article-a",
-        "article-b",
-        "article-c",
-        "article-d",
-    ]
+    assert len({claim.claim_id for claim in answer.claims}) == 4
+    assert [claim.claim[:3] for claim in answer.claims] == ["(a)", "(b)", "(c)", "(d)"]
     assert "不得超过3%" in answer.answer
     assert "本条(b)不适用" in answer.answer
     assert "燃油系统部件" not in answer.answer

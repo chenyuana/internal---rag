@@ -492,6 +492,79 @@ h1 em {
   box-shadow: 0 0 0 3px rgba(30, 101, 72, 0.1);
 }
 
+.llm-structure-panel {
+  padding: 14px;
+  border: 1px solid rgba(30, 101, 72, 0.2);
+  border-radius: 15px;
+  background: #f7faf7;
+}
+
+.llm-structure-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.llm-structure-toggle input {
+  margin-top: 3px;
+  accent-color: var(--green);
+}
+
+.llm-structure-toggle span,
+.llm-structure-toggle small {
+  display: block;
+}
+
+.llm-structure-toggle small,
+.llm-structure-warning,
+.llm-structure-actions span {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.llm-structure-warning {
+  margin: 10px 0 0;
+  color: #7a551c;
+}
+
+.llm-structure-settings {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.llm-structure-settings summary {
+  padding-top: 10px;
+  color: var(--green-deep);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.llm-structure-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.llm-structure-grid .field {
+  margin: 0;
+}
+
+.llm-structure-grid .compact-number input {
+  max-width: 170px;
+}
+
+.llm-structure-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
 .primary-button,
 .secondary-button,
 .text-button {
@@ -1459,15 +1532,27 @@ h1 em {
   background: #fff9ef;
 }
 
+.page-diagnostic.warning strong {
+  color: #9a5d09;
+}
+
 .page-diagnostic.failed {
   border-color: rgba(168, 67, 56, 0.45);
   background: #fff4f1;
+}
+
+.page-diagnostic.failed strong {
+  color: var(--red);
 }
 
 .page-diagnostic.excluded {
   border-color: var(--line);
   background: #f0eee7;
   opacity: 0.72;
+}
+
+.page-diagnostic.excluded strong {
+  color: var(--muted);
 }
 
 .page-dialog {
@@ -1847,6 +1932,15 @@ h1 em {
   }
 
   .batch-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .llm-structure-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .llm-structure-actions {
     align-items: stretch;
     flex-direction: column;
   }

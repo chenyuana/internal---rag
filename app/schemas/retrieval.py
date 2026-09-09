@@ -226,6 +226,7 @@ class Citation(BaseModel):
     citation_id: str
     chunk_id: str
     document_id: str
+    dataset_id: str | None = None
     document_name: str | None = None
     version: str | None = None
     source_path: str | None = None

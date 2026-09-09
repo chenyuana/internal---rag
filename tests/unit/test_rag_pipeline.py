@@ -353,6 +353,7 @@ def scope_execution() -> RetrievalExecution:
 async def test_pipeline_repairs_cross_regulation_scope_violation(
     settings: Settings,
 ) -> None:
+    settings.generation.answer_mode = "llm"
     pipeline = RagPipeline(
         settings=settings,
         retrieval=cast(
@@ -422,6 +423,7 @@ class FakeDegradingAnswerModel:
 async def test_pipeline_drops_invalid_claim_after_failed_model_repair(
     settings: Settings,
 ) -> None:
+    settings.generation.answer_mode = "llm"
     pipeline = RagPipeline(
         settings=settings,
         retrieval=cast(
@@ -479,6 +481,7 @@ class FakeAllInvalidAnswerModel:
 async def test_pipeline_returns_safe_unanswerable_when_all_claims_fail(
     settings: Settings,
 ) -> None:
+    settings.generation.answer_mode = "llm"
     pipeline = RagPipeline(
         settings=settings,
         retrieval=cast(

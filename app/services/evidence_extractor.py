@@ -5,6 +5,7 @@ import re
 from app.core.config import GenerationSettings
 from app.schemas.chat import EvidenceSentence
 from app.schemas.retrieval import NormalizedQuery, SelectedChunk
+from app.services.article_identity import owns_requested_article
 from app.services.evidence_text import (
     has_parameter_value,
     is_parametric_text,
@@ -44,6 +45,21 @@ class EvidenceExtractor:
     ) -> list[EvidenceSentence]:
         ranked: list[tuple[float, int, int, EvidenceSentence]] = []
         for chunk_rank, chunk in enumerate(chunks):
+            if query.article_ids and owns_requested_article(chunk, query.article_ids):
+                # A normative clause's intro, subordinate items and exceptions
+                # form one evidence unit. Sentence ranking must not separate
+                # a condition from the numeric requirement that it governs.
+                body = "\n".join(
+                    line for line in chunk.text.splitlines() if not _META_PREFIX.match(line)
+                ).strip()
+                if body:
+                    ranked.append((1.0, chunk_rank, 0, EvidenceSentence(
+                        citation_id=chunk.citation_id, chunk_id=chunk.chunk_id,
+                        text=self._with_source(chunk.metadata.document_name, body,
+                                               self._chunk_section_leaf(chunk)),
+                        document_name=chunk.metadata.document_name, version=chunk.metadata.version,
+                    )))
+                    continue
             sentences = self._merge_subitem_follow_ons(
                 self._merge_table_rows(
                     [

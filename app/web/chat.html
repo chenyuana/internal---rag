@@ -6,7 +6,8 @@
     <meta name="color-scheme" content="light" />
     <title>智能问答 · Internal RAG</title>
     <meta name="description" content="基于企业资料证据的多轮智能问答" />
-    <link rel="stylesheet" href="/assets/chat.css?v=20260825-1" />
+    <link rel="stylesheet" href="/assets/chat.css?v=20260904-citations" />
+    <link rel="stylesheet" href="/assets/citation_pdf.css?v=20260904-2" />
   </head>
   <body>
     <header class="topbar">
@@ -27,6 +28,7 @@
         <div class="chat-toolbar">
           <label class="compact-field"><span>知识范围</span><select id="kbSelect" class="control-select"><option value="">加载中…</option></select></label>
           <label class="compact-field model-field"><span>答案模型</span><select id="modelSelect" class="control-select"><option value="">加载中…</option></select></label>
+          <label class="compact-field think-field" title="对答案模型启用思考/推理"><input type="checkbox" id="thinkingToggle" checked /><span>思考</span></label>
           <button class="toolbar-button" id="openModelDialog" type="button">接入 API</button>
           <button class="icon-button remove-model" id="removeModelConnection" type="button" aria-label="移除当前 API 连接" hidden>−</button>
         </div>
@@ -77,7 +79,22 @@
         <div class="dialog-actions"><button class="toolbar-button" id="cancelModelConnection" type="button">取消</button><button class="primary-button" id="connectModelButton" type="submit">连接并读取模型</button></div>
       </form>
     </dialog>
+    <dialog id="citationPdfDialog" class="citation-pdf-dialog" aria-labelledby="citationPdfTitle">
+      <div class="citation-pdf-head"><h2 id="citationPdfTitle">引用原文</h2><a id="citationPdfOpen" target="_blank" rel="noopener" hidden>在新标签页打开</a><button id="closeCitationPdf" class="icon-button" type="button" aria-label="关闭原文预览">×</button></div>
+      <p id="citationPdfStatus" role="status"></p>
+      <iframe id="citationPdfFrame" title="引用 PDF 原文" hidden></iframe>
+      <div id="citationPdfPages" hidden>
+        <button id="citationPdfPrevious" type="button">上一页</button>
+        <label>原文页码 <input id="citationPdfPageNumber" type="number" min="1" value="1" /></label>
+        <span id="citationPdfPageTotal"></span><button id="citationPdfGo" type="button">跳转</button>
+        <button id="citationPdfNext" type="button">下一页</button>
+      </div>
+      <div id="citationPdfCanvasHost" aria-label="PDF 原文页面"></div>
+      <details class="citation-pdf-quote"><summary>对照引用文字</summary><p id="citationPdfQuote"></p></details>
+    </dialog>
     <script src="/assets/markdown.js?v=20260821-3"></script>
-    <script src="/assets/chat.js?v=20260826-1"></script>
+    <script src="/assets/citation_pdf_renderer.js?v=20260904-2"></script>
+    <script src="/assets/citation_pdf.js?v=20260904-location-3"></script>
+    <script src="/assets/chat.js?v=20260904-location-3"></script>
   </body>
 </html>

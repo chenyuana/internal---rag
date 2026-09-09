@@ -9,7 +9,7 @@
       name="description"
       content="内网技术资料自动解析、质量复核与 RAGFlow 发布工作台"
     />
-    <link rel="stylesheet" href="/assets/ingestion.css?v=20260824-nav-2" />
+    <link rel="stylesheet" href="/assets/ingestion.css?v=20260908-page-tone-1" />
   </head>
   <body>
     <header class="topbar">
@@ -110,6 +110,53 @@
             />
           </label>
 
+          <section class="llm-structure-panel" aria-labelledby="llmStructureTitle">
+            <label class="llm-structure-toggle">
+              <input id="llmStructureEnabled" type="checkbox" />
+              <span>
+                <strong id="llmStructureTitle">LLM 结构增强</strong>
+                <small>原生解析结果不理想时启用；默认关闭</small>
+              </span>
+            </label>
+            <p class="llm-structure-warning">
+              仅重标注章节、附录、条号、标题和关键词，不修改正文或表格数据。启用后的结果必须人工复核。
+            </p>
+            <details class="llm-structure-settings">
+              <summary>配置结构识别模型</summary>
+              <div class="llm-structure-grid">
+                <label class="field">
+                  <span>OpenAI 兼容接口地址</span>
+                  <input id="llmStructureBaseUrl" type="url" placeholder="https://api.deepseek.com/v1" />
+                </label>
+                <label class="field">
+                  <span>模型名称</span>
+                  <input id="llmStructureModel" type="text" placeholder="deepseek-v4-flash" />
+                </label>
+                <label class="field">
+                  <span>API Key</span>
+                  <input id="llmStructureApiKey" type="password" autocomplete="new-password" placeholder="留空则保留已配置密钥" />
+                </label>
+                <label class="field compact-number">
+                  <span>每批页数</span>
+                  <input id="llmStructurePageBatchSize" type="number" min="1" max="50" value="3" />
+                </label>
+                <label class="field compact-number">
+                  <span>最大输出 Token</span>
+                  <input id="llmStructureMaxTokens" type="number" min="128" max="8192" value="2048" />
+                </label>
+                <label class="field compact-number">
+                  <span>超时（秒）</span>
+                  <input id="llmStructureTimeout" type="number" min="1" step="1" value="180" />
+                </label>
+              </div>
+              <div class="llm-structure-actions">
+                <span id="llmStructureKeyStatus">尚未配置 API Key</span>
+                <button class="secondary-button" id="saveLlmStructureSettings" type="button">保存模型配置</button>
+              </div>
+              <p class="form-message" id="llmStructureMessage" role="status"></p>
+            </details>
+          </section>
+
           <button class="primary-button" id="uploadButton" type="button" disabled>
             提交自动处理
           </button>
@@ -171,6 +218,9 @@
             </label>
             <button class="secondary-button" id="batchPublishButton" type="button" disabled>
               批量发送
+            </button>
+            <button class="secondary-button" id="batchExportButton" type="button" disabled>
+              批量导出
             </button>
           </div>
           <div class="batch-progress" id="batchPublishProgress" hidden aria-live="polite">
@@ -325,6 +375,9 @@
             <button class="secondary-button" id="dryRunButton" type="button">
               生成发布计划
             </button>
+            <button class="secondary-button" id="exportButton" type="button">
+              导出处理结果
+            </button>
             <button class="primary-button danger-safe" id="publishButton" type="button">
               发布到测试知识库
             </button>
@@ -417,6 +470,6 @@
       </form>
     </dialog>
 
-    <script src="/assets/ingestion.js?v=20260811-docx-1" defer></script>
+    <script src="/assets/ingestion.js?v=20260908-llm-1" defer></script>
   </body>
 </html>

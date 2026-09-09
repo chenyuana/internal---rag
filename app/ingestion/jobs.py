@@ -7,20 +7,31 @@ import logging
 import re
 import shutil
 from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from fastapi import UploadFile
+from pydantic import SecretStr
 
-from app.core.config import IngestionSettings, RagflowSettings
+from app.core.config import IngestionSettings, LlmStructureSettings, RagflowSettings
 from app.core.exceptions import AppError
+from app.ingestion.exporters import (
+    build_batch_export_archive,
+    build_export_archive,
+    render_markdown,
+)
+from app.ingestion.llm_structure_store import module_store
 from app.ingestion.parsers import ParserRegistry
 from app.ingestion.parsers.docx import DOCX_MIME_TYPE, validate_docx_package
 from app.ingestion.parsers.figure_vision import FigureVisionClient
 from app.ingestion.parsers.hybrid_pdf import HybridPdfParser
+from app.ingestion.parsers.llm_structure import LlmStructureAnnotator
+from app.ingestion.parsers.native_pdf import NativePdfParser
 from app.ingestion.parsers.remote import DoclingClient, MinerUClient
+from app.ingestion.parsers.scan_regulatory import ScannedRegulatoryPdfParser
 from app.ingestion.pipeline import write_document
 from app.ingestion.publishers import RagflowPlan, RagflowPublisher
 from app.schemas.ingestion import (
@@ -185,6 +196,7 @@ class IngestionJobService:
         batch_id: str | None = None,
         sequence_in_batch: int | None = None,
         created_by: str,
+        llm_structure_enabled: bool = False,
     ) -> IngestionJob:
         if not self._settings.enabled:
             raise AppError(
@@ -280,6 +292,7 @@ class IngestionJobService:
             knowledge_base_id=knowledge_base_id,
             created_by=created_by,
             original_path=str(original_path),
+            llm_structure_enabled=llm_structure_enabled,
             progress=IngestionProgress(),
             review=IngestionReview(updated_at=now),
             created_at=now,
@@ -287,6 +300,49 @@ class IngestionJobService:
         )
         self._write_job(job)
         return job
+
+    def _parse_with_structure(
+        self,
+        source_path: Path,
+        job: IngestionJob,
+        progress_callback: Callable[[int, int], None] | None,
+    ) -> object:
+        """Run the selected parser, optionally enabling LLM structure annotation.
+
+        The ingestion console toggle decides whether this job re-annotates
+        chunk metadata (section_path/article_id/title/keywords) with the LLM.
+        Model endpoint / API key / model name come from the console settings
+        (process memory, per operator) and fall back to the ``llm_structure``
+        env config; on any error the heuristic metadata is kept.
+        """
+        settings = self._resolve_structure_settings(job.created_by)
+        annotator: LlmStructureAnnotator | None = None
+        if job.llm_structure_enabled and settings is not None:
+            annotator = LlmStructureAnnotator(settings)
+            self._parsers.set_structure_annotator(annotator)
+        try:
+            document = self._parsers.parse(source_path, progress_callback=progress_callback)
+        finally:
+            if annotator is not None:
+                self._parsers.clear_structure_annotator()
+                annotator.close()
+        return document
+
+    def _resolve_structure_settings(self, user_id: str) -> LlmStructureSettings | None:
+        """Return LLM structure settings for this operator, or ``None`` to skip."""
+        store_cfg = module_store.get(user_id)
+        if store_cfg is not None and store_cfg.api_key:
+            return LlmStructureSettings(
+                base_url=store_cfg.base_url,
+                model=store_cfg.model,
+                api_key=SecretStr(store_cfg.api_key),
+                max_tokens=store_cfg.max_tokens,
+                page_batch_size=store_cfg.page_batch_size,
+                timeout_seconds=store_cfg.timeout_seconds,
+            )
+        if self._settings.llm_structure.api_key.get_secret_value():
+            return self._settings.llm_structure
+        return None
 
     async def process_job(self, job_id: str) -> IngestionJob:
         lock = self._locks.setdefault(job_id, asyncio.Lock())
@@ -318,9 +374,9 @@ class IngestionJobService:
                         stage="parsing",
                         percent=min(percent, 81),
                         message=(
-                            f"远程 OCR 处理中：{done}/{total} 页"
+                            f"页面处理中：{done}/{total} 页"
                             if done < total
-                            else f"远程 OCR 完成：{total} 页，正在合并"
+                            else f"页面处理完成：{total} 页，正在合并"
                         ),
                         current=done,
                         total=total,
@@ -337,11 +393,43 @@ class IngestionJobService:
                 )
                 job.updated_at = self._now()
                 self._write_job(job)
-                document = await asyncio.to_thread(
-                    self._parsers.parse,
-                    source_path,
-                    progress_callback=_report_ocr_progress,
-                )
+                if job.page_reprocess:
+                    previous_ir = self._load_document_ir(job)
+                    previous_parser = previous_ir.get("parser", {}).get("name")
+                    if previous_parser == "scan-regulatory-pdf":
+                        page_parser = ScannedRegulatoryPdfParser(
+                            MinerUClient(self._settings.mineru)
+                        )
+                    elif previous_parser == "hybrid-pdf":
+                        page_parser = HybridPdfParser(
+                            NativePdfParser(),
+                            MinerUClient(self._settings.mineru),
+                            DoclingClient(self._settings.docling),
+                            FigureVisionClient(self._settings.figure_vlm),
+                        )
+                    else:
+                        raise ValueError(
+                            f"Parser {previous_parser!r} does not support page reprocessing"
+                        )
+                    document = await asyncio.to_thread(
+                        page_parser.reprocess_page,
+                        source_path,
+                        previous_ir,
+                        Path(job.output_path or ""),
+                        job.page_reprocess["page_number"],
+                        job.page_reprocess["mode"],
+                        progress_callback=_report_ocr_progress,
+                    )
+                    document.qa.setdefault("page_reprocess", {})["previous_output_path"] = (
+                        job.output_path
+                    )
+                else:
+                    document = await asyncio.to_thread(
+                        self._parse_with_structure,
+                        source_path,
+                        job,
+                        _report_ocr_progress,
+                    )
                 page_count = int(document.qa.get("page_count", len(document.pages)))
                 job.progress = IngestionProgress(
                     stage="writing",
@@ -353,6 +441,9 @@ class IngestionJobService:
                 job.updated_at = self._now()
                 self._write_job(job)
                 output_root = self._outputs / job.job_id
+                if job.page_reprocess:
+                    # Write a new revision completely before switching the active pointer.
+                    output_root = output_root / "revisions" / uuid4().hex
                 output = await asyncio.to_thread(
                     write_document,
                     output_root,
@@ -379,6 +470,9 @@ class IngestionJobService:
                 else:
                     status = IngestionJobStatus.COMPLETED
                 job.status = status
+                if job.page_reprocess:
+                    job.review = IngestionReview(updated_at=self._now())
+                    job.publication = RagflowPublication(updated_at=self._now())
                 job.output_path = str(output["output_folder"])
                 job.quality = IngestionQualitySummary(
                     route=document.route,
@@ -423,6 +517,16 @@ class IngestionJobService:
                     percent=job.progress.percent,
                     message=str(exc),
                 )
+            if job.page_reprocess:
+                if job.status == IngestionJobStatus.FAILED:
+                    previous = IngestionJob.model_validate(job.page_reprocess["previous_job"])
+                    previous.error_code = job.error_code
+                    previous.error_message = "单页处理失败，旧结果已保留：" + (
+                        job.error_message or ""
+                    )
+                    previous.progress.message = previous.error_message
+                    job = previous
+                job.page_reprocess = None
             job.updated_at = self._now()
             self._write_job(job)
             return job
@@ -475,18 +579,65 @@ class IngestionJobService:
         )
         return jobs[offset : offset + limit]
 
+    async def reprocess_page(self, job_id: str, page_number: int, mode: str) -> IngestionJob:
+        lock = self._locks.setdefault(job_id, asyncio.Lock())
+        async with lock:
+            job = self._read_job(job_id)
+
+            def reject(message: str) -> None:
+                raise AppError(
+                    code="INGESTION_PAGE_REPROCESS_BLOCKED", message=message, status_code=409
+                )
+
+            if job.status not in {
+                IngestionJobStatus.COMPLETED,
+                IngestionJobStatus.WARNING,
+                IngestionJobStatus.NEEDS_REVIEW,
+            }:
+                reject("请等待任务完成后再进行单页处理。")
+            if job.publication.document_id or job.publication.status in {
+                PublicationStatus.PUBLISHING,
+                PublicationStatus.PUBLISHED,
+                PublicationStatus.FAILED,
+            }:
+                reject("已发布或部分发布的任务暂不支持单页处理，避免影响知识库中的旧版本。")
+            ir = self._load_document_ir(job)
+            if ir.get("parser", {}).get("name") not in {
+                "scan-regulatory-pdf",
+                "hybrid-pdf",
+            }:
+                reject("此解析类型暂不支持单页处理。")
+            if any(c.get("manual_revision") for c in ir.get("chunks", [])) or any(
+                p.get("manual_edited") for p in ir.get("pages", [])
+            ):
+                reject("文档包含人工修订；重建 Chunk 可能产生冲突，已保留原结果并取消操作。")
+            if mode not in {"clean", "ocr"} or not any(
+                p.get("page_number") == page_number for p in ir.get("pages", [])
+            ):
+                raise AppError(
+                    code="INGESTION_PAGE_INVALID", message="页码或处理方式无效。", status_code=422
+                )
+            job.page_reprocess = {
+                "page_number": page_number,
+                "mode": mode,
+                "previous_job": job.model_dump(mode="json"),
+            }
+            job.status = IngestionJobStatus.QUEUED
+            job.progress = IngestionProgress(message=f"等待处理第 {page_number} 页；其他页复用缓存")
+            job.updated_at = self._now()
+            self._write_job(job)
+            return job
+
     async def retry_job(self, job_id: str) -> IngestionJob:
         job = self._read_job(job_id)
-        if job.status == IngestionJobStatus.RUNNING:
+        if job.status == IngestionJobStatus.RUNNING or job.page_reprocess:
             raise AppError(
                 code="INGESTION_JOB_RUNNING",
                 message="A running ingestion job cannot be retried.",
                 status_code=409,
             )
         now = self._now()
-        previous_dataset_id = (
-            job.publication.dataset_id or job.knowledge_base_id
-        )
+        previous_dataset_id = job.publication.dataset_id or job.knowledge_base_id
         job.status = IngestionJobStatus.QUEUED
         job.progress = IngestionProgress(
             stage="queued",
@@ -608,9 +759,7 @@ class IngestionJobService:
                 reviewed_at=reviewed_at,
                 quality_gate_override=bool(overridden_quality_gates),
                 overridden_quality_gates=overridden_quality_gates,
-                quality_gate_overridden_at=(
-                    now if overridden_quality_gates else None
-                ),
+                quality_gate_overridden_at=(now if overridden_quality_gates else None),
                 updated_at=now,
             )
             job.updated_at = now
@@ -671,7 +820,8 @@ class IngestionJobService:
             if (
                 job_id == self._active_job_id
                 or job_id in self._scheduled
-                or job.status in {
+                or job.status
+                in {
                     IngestionJobStatus.QUEUED,
                     IngestionJobStatus.RUNNING,
                 }
@@ -830,8 +980,7 @@ class IngestionJobService:
             item
             for item in payload.get("chunks", [])
             if isinstance(item, dict)
-            and int(item.get("page_start", 0)) <= page_number
-            <= int(item.get("page_end", 0))
+            and int(item.get("page_start", 0)) <= page_number <= int(item.get("page_end", 0))
         ]
         asset_version = int(job.updated_at.timestamp() * 1_000_000)
         assets = [
@@ -849,6 +998,26 @@ class IngestionJobService:
         trace = parser.get("trace", []) if isinstance(parser, dict) else []
         quality = payload.get("qa", {})
         gates = quality.get("quality_gates", []) if isinstance(quality, dict) else []
+        parser_name = parser.get("name") if isinstance(parser, dict) else None
+        block_reason = ""
+        if parser_name not in {"scan-regulatory-pdf", "hybrid-pdf"}:
+            block_reason = "此解析类型暂不支持单页处理。"
+        elif job.status not in {
+            IngestionJobStatus.COMPLETED,
+            IngestionJobStatus.WARNING,
+            IngestionJobStatus.NEEDS_REVIEW,
+        }:
+            block_reason = "任务正在排队或处理中，请等待完成。"
+        elif job.publication.document_id or job.publication.status in {
+            PublicationStatus.PUBLISHING,
+            PublicationStatus.PUBLISHED,
+            PublicationStatus.FAILED,
+        }:
+            block_reason = "已发布或部分发布的任务暂不支持单页处理，以保护知识库旧版本。"
+        elif any(chunk.get("manual_revision") for chunk in payload.get("chunks", [])) or any(
+            item.get("manual_edited") for item in payload.get("pages", [])
+        ):
+            block_reason = "文档包含人工修订；重建 Chunk 可能产生冲突，已保留原结果并取消操作。"
         return IngestionPageDetail(
             job_id=job.job_id,
             source_name=job.source_name,
@@ -859,6 +1028,7 @@ class IngestionJobService:
             assets=assets,
             parser_trace=trace,
             quality_gates=gates,
+            page_reprocess={"supported": not block_reason, "reason": block_reason},
             source_url=f"/api/v1/ingestion/jobs/{job.job_id}/source#page={page_number}",
         )
 
@@ -897,7 +1067,8 @@ class IngestionJobService:
             if (
                 job_id == self._active_job_id
                 or job_id in self._scheduled
-                or job.status in {
+                or job.status
+                in {
                     IngestionJobStatus.QUEUED,
                     IngestionJobStatus.RUNNING,
                 }
@@ -1004,17 +1175,14 @@ class IngestionJobService:
                 if not isinstance(gate, dict) or gate.get("gate") != "manual_revision"
             ]
             manual_revision_count = sum(
-                bool(item.get("manual_revision"))
-                for item in chunks
-                if isinstance(item, dict)
+                bool(item.get("manual_revision")) for item in chunks if isinstance(item, dict)
             )
             gates.append(
                 {
                     "gate": "manual_revision",
                     "status": "warn",
                     "message": (
-                        f"已有 {manual_revision_count} "
-                        "个 Chunk 经人工修订；发布前请复核修改记录。"
+                        f"已有 {manual_revision_count} 个 Chunk 经人工修订；发布前请复核修改记录。"
                     ),
                 }
             )
@@ -1052,8 +1220,7 @@ class IngestionJobService:
                 )
 
             warning_count = sum(
-                isinstance(gate, dict) and gate.get("status") == "warn"
-                for gate in gates
+                isinstance(gate, dict) and gate.get("status") == "warn" for gate in gates
             )
             job.quality.warning_count = warning_count
             if job.status == IngestionJobStatus.COMPLETED:
@@ -1126,10 +1293,7 @@ class IngestionJobService:
         output_folder = Path(job.output_path).resolve()
         relative_path = Path(str(asset.get("relative_path", "")))
         asset_path = (output_folder / relative_path).resolve()
-        if (
-            not asset_path.is_relative_to(output_folder)
-            or not asset_path.is_file()
-        ):
+        if not asset_path.is_relative_to(output_folder) or not asset_path.is_file():
             raise AppError(
                 code="INGESTION_ASSET_MISSING",
                 message="The requested parsed asset file is unavailable.",
@@ -1137,6 +1301,87 @@ class IngestionJobService:
                 details={"job_id": job_id, "asset_id": asset_id},
             )
         return asset_path, str(asset.get("mime_type", "application/octet-stream"))
+
+    def export_job(
+        self,
+        job_id: str,
+        *,
+        format: str = "zip",
+    ) -> tuple[bytes, str, str]:
+        job = self._read_job(job_id)
+        if job.status not in {
+            IngestionJobStatus.COMPLETED,
+            IngestionJobStatus.WARNING,
+            IngestionJobStatus.NEEDS_REVIEW,
+        }:
+            raise AppError(
+                code="INGESTION_EXPORT_NOT_READY",
+                message="清洗结果尚未就绪；只有质量通过、需要抽检或需要复核的资料才能导出。",
+                status_code=409,
+                details={"status": job.status.value},
+            )
+        document_ir = self._load_document_ir(job)
+        asset_root = Path(job.output_path) if job.output_path else None
+        stem = Path(job.source_name).stem or "document"
+        safe_stem = SAFE_FILENAME_RE.sub("_", stem).strip(" .") or "document"
+        normalized = (format or "zip").casefold()
+        if normalized == "md":
+            markdown = render_markdown(document_ir, include_images=False)
+            return (
+                markdown.encode("utf-8"),
+                f"{safe_stem}.md",
+                "text/markdown; charset=utf-8",
+            )
+        if normalized != "zip":
+            raise AppError(
+                code="INGESTION_EXPORT_FORMAT_UNSUPPORTED",
+                message="不支持的导出格式；仅支持 zip 或 md。",
+                status_code=422,
+                details={"format": format},
+            )
+        archive = build_export_archive(document_ir, asset_root, job.source_name)
+        return archive, f"{safe_stem}.zip", "application/zip"
+
+    def export_jobs(self, job_ids: list[str]) -> tuple[bytes, str, str]:
+        documents: list[tuple[dict[str, Any], Path | None, str]] = []
+        for job_id in dict.fromkeys(job_ids):
+            job = self._read_job(job_id)
+            if job.status not in {
+                IngestionJobStatus.COMPLETED,
+                IngestionJobStatus.WARNING,
+                IngestionJobStatus.NEEDS_REVIEW,
+            }:
+                raise AppError(
+                    code="INGESTION_EXPORT_NOT_READY",
+                    message=f"“{job.source_name}”的清洗结果尚未就绪，无法导出。",
+                    status_code=409,
+                    details={"job_id": job_id, "status": job.status.value},
+                )
+            document_ir = self._load_document_ir(job)
+            documents.append(
+                (
+                    document_ir,
+                    Path(job.output_path) if job.output_path else None,
+                    job.source_name,
+                )
+            )
+        if not documents:
+            raise AppError(
+                code="INGESTION_EXPORT_EMPTY",
+                message="没有可导出的资料。",
+                status_code=422,
+            )
+        archive = build_batch_export_archive(documents)
+        return archive, "cleaned-export.zip", "application/zip"
+
+    def published_source_file(self, dataset_id: str, document_id: str):
+        """Find the immutable local source for an exact publication identity."""
+        for job_path in self._jobs.glob("*/job.json"):
+            job = IngestionJob.model_validate_json(job_path.read_text(encoding="utf-8"))
+            if (job.publication.dataset_id == dataset_id
+                    and job.publication.document_id == document_id):
+                return self.source_file(job.job_id)
+        return None
 
     def _load_document_ir(self, job: IngestionJob) -> dict[str, Any]:
         if not job.output_path:
@@ -1194,10 +1439,7 @@ class IngestionJobService:
         ):
             raise AppError(
                 code="INGESTION_QUALITY_GATE_BLOCKED",
-                message=(
-                    "只有质量通过、警告级，或已由人工显式确认失败门禁无误的任务"
-                    "才能发布。"
-                ),
+                message=("只有质量通过、警告级，或已由人工显式确认失败门禁无误的任务才能发布。"),
                 status_code=409,
                 details={"status": job.status.value},
             )
@@ -1299,9 +1541,7 @@ class IngestionJobService:
                 99,
                 5 + int(completed_chunks / total_chunks * 94),
             )
-            job.publication.message = (
-                f"正在写入 Chunk：{completed_chunks}/{len(plan.chunks)}"
-            )
+            job.publication.message = f"正在写入 Chunk：{completed_chunks}/{len(plan.chunks)}"
             job.publication.published_chunk_count = published
             job.publication.skipped_chunk_count = skipped
             job.publication.updated_at = self._now()
@@ -1318,9 +1558,7 @@ class IngestionJobService:
             job.publication.status = PublicationStatus.PUBLISHED
             job.publication.stage = "published"
             job.publication.percent = 100
-            job.publication.message = (
-                f"发布完成：新增 {published}，跳过 {skipped}"
-            )
+            job.publication.message = f"发布完成：新增 {published}，跳过 {skipped}"
             job.publication.document_id = document_id
             job.publication.published_chunk_count = published
             job.publication.skipped_chunk_count = skipped
@@ -1396,3 +1634,6 @@ class IngestionJobService:
             self._worker_task = None
         if self._publisher is not None:
             await self._publisher.close()
+        close_parsers = getattr(self._parsers, "close", None)
+        if callable(close_parsers):
+            await asyncio.to_thread(close_parsers)

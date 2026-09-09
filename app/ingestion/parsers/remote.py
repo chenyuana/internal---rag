@@ -109,7 +109,9 @@ _LATEX_SYMBOLS = {
     r"\mp": "∓",
 }
 _GREEK_OR_SYMBOL_RE = re.compile(
-    "|".join(re.escape(key) for key in sorted(_LATEX_SYMBOLS, key=len, reverse=True))
+    "(?:"
+    + "|".join(re.escape(key) for key in sorted(_LATEX_SYMBOLS, key=len, reverse=True))
+    + r")(?![A-Za-z])"
 )
 
 _PUNCT_RE = re.compile(r"^[，。；;:：、,.]$")
@@ -125,13 +127,113 @@ _NAMED_OPERATOR_RE = re.compile(
 )
 
 
-def _latex_if_real(item: dict[str, Any]) -> str | None:
+def _repair_gust_load_formula_ocr(latex: str, compact: str) -> str | None:
+    """Recover three FAA gust-load identities from unambiguous OCR signatures.
+
+    These are not document or page exceptions.  Older scanned Federal Register
+    pages repeatedly make the same glyph substitutions inside these identities:
+    ``vt`` becomes ``SΦ``/``ΦΦ``, ``V`` becomes ``∇VΨ``, and a lower-case
+    ``l`` becomes an upper-case ``I``.  Rewriting on any one of those signals
+    would be unsafe, so every branch below requires the complete operator and
+    numeric signature of one mathematical identity.  A near match is retained
+    for review rather than being silently altered.
+    """
+    if (
+        "\\nabla" in latex
+        and "\\varPsi" in latex
+        and "498" in compact
+        and "\\frac" in compact
+        and re.search(r"\\mathbf\s*\{\s*L\s*\}", latex)
+    ):
+        return r"L_{vt} = \frac{K_{gt} U_{de} V a_{vt} S_{vt}}{498}"
+    if (
+        "0.88" in compact
+        and "5.3+" in compact
+        and "\\mu" in compact
+        and re.search(r"\\mathbf\s*\{\s*k\s*\}", latex, re.IGNORECASE)
+        and compact.endswith("=")
+    ):
+        return r"k_{gt} = \frac{0.88\mu_{gt}}{5.3 + \mu_{gt}}"
+    if (
+        "\\mu" in compact
+        and "2\\mathrm{W}" in compact
+        and "\\rho" in compact
+        and re.search(r"\\mathrm\s*\{\s*I\s*\}\s*_", latex)
+        and "\\frac" in compact
+    ):
+        return (
+            r"\mu_{gt} = \frac{2W}{\rho\bar{c}_{t} g a_{vt} S_{vt}}"
+            r"\frac{K^{2}}{l_{vt}^{2}}"
+        )
+    return None
+
+
+def normalize_formula_ocr(latex: str) -> str:
+    """Repair formula OCR only when the surrounding math identity is unambiguous.
+
+    MinerU can read the small ``1`` subscripts in the standard Head Injury
+    Criterion formula as punctuation (``t_{:}``).  The formula itself, its
+    integral bounds, and the adjacent definition of ``t1``/``t2`` make the
+    intended identity deterministic.  Keep this rule formula-shaped rather
+    than document/page-shaped so unrelated punctuation subscripts are not
+    changed.
+    """
+
+    compact = re.sub(r"\s+", "", latex)
+    if (
+        re.search(r"HIC=|HIC\\?=", compact, re.IGNORECASE)
+        or "HIC" in compact.upper()
+    ) and all(token in compact for token in ("a(t)", "2.5")) and re.search(
+        r"\\int(?:op)?", latex
+    ) and re.search(r"t\s*_\s*\{\s*:\s*\}", latex):
+        return (
+            r"HIC = \left\{(t_{2}-t_{1})"
+            r"\left[\frac{1}{t_{2}-t_{1}}"
+            r"\int_{t_{1}}^{t_{2}}a(t)\,dt\right]^{2.5}"
+            r"\right\}_{\max}"
+        )
+    if repaired := _repair_gust_load_formula_ocr(latex, compact):
+        return repaired
+    return latex
+
+
+def formula_latex(item: dict[str, Any]) -> str | None:
     """Return the raw LaTeX for an equation item, guarding against empty text
     and the string ``"None"`` that ``str(None)`` would otherwise produce."""
     raw = str(item.get("text", "") or "").strip()
     if not raw or raw.casefold() == "none":
         return None
-    return raw
+    return normalize_formula_ocr(raw)
+
+
+_LEADING_LATEX_FORMULA_RE = re.compile(
+    r"^\s*\$(?!\$)(?P<latex>[^$\n]+)\$(?P<tail>.*)$",
+    re.DOTALL,
+)
+
+
+def leading_latex_formula(text: str) -> tuple[str, str] | None:
+    """Split a display-style formula mislabeled by MinerU as ordinary text.
+
+    A real inline formula remains prose.  This only promotes an item that
+    *begins* with one complete LaTeX span, has an equation sign and a
+    structural math operator (fraction, root, sum, integral, or product).
+    MinerU commonly emits a display formula followed by its definition this
+    way, e.g. ``$k=\\frac{a}{b}$ gust alleviation factor``.  The returned tail
+    stays as a separate paragraph so its explanatory prose is not lost.
+    """
+
+    match = _LEADING_LATEX_FORMULA_RE.match(text)
+    if not match:
+        return None
+    latex = match.group("latex").strip()
+    compact = re.sub(r"\s+", "", latex)
+    if "=" not in compact or not any(
+        token in compact
+        for token in (r"\frac", r"\sqrt", r"\sum", r"\int", r"\prod")
+    ):
+        return None
+    return normalize_formula_ocr(latex), match.group("tail").strip()
 
 
 def _subscript(content: str) -> str:
@@ -283,6 +385,10 @@ def latex_to_text(latex: str) -> str:
     # a line break, not a LaTeX command; drop it before command cleanup so a
     # trailing letter does not form a bogus command like `\nm`.
     text = text.replace(r"\n", "").replace("\n", "")
+    # Poor-man's bold is formatting, not the plus/minus command (\pm).
+    # Remove only the complete command, leaving all nested groups and scripts
+    # intact. Also supports the unbraced form emitted by formula OCR.
+    text = re.sub(r"\\pmb(?![A-Za-z])\s*", "", text)
     text = re.sub(
         r"\\(?:mathrm|mathbf|mathit|text|mathcal|operatorname|rm)\s*\{([^{}]*)\}",
         lambda match: re.sub(r"\s+", "", match.group(1)),
@@ -296,7 +402,12 @@ def latex_to_text(latex: str) -> str:
     text = re.sub(
         r"\\(?:vec|hat|widehat|bar|overline|underline|underbrace|"
         r"widetilde|dot|ddot|bb|mathbb|mathbf|boldsymbol)\s*\{([^{}]*)\}",
-        lambda match: match.group(1),
+        # Keep a separator while unwrapping an accent.  Without it,
+        # ``\rho\bar{c}`` becomes ``\rhoc``; the later LaTeX-symbol pass
+        # then sees an unknown command and drops both rho and c. Whitespace is
+        # collapsed after command conversion, so this has no visible effect on
+        # ordinary accented variables such as ``\bar{x}``.
+        lambda match: " " + match.group(1),
         text,
     )
     # `\small` can wrap a brace group that itself contains `\left...\right`;
@@ -382,6 +493,7 @@ class RemoteContentBlock:
     latex: str | None = None
     source_type: str = ""
     text_level: int | None = None
+    raw_item: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -481,7 +593,7 @@ class MinerUClient(RemoteParserClient):
             return "\n".join(str(value) for value in item.get("list_items", [])).strip()
         raw = str(item.get("text", "")).strip()
         if item_type in {"equation", "interline_equation", "inline_equation"}:
-            return latex_to_text(raw)
+            return latex_to_text(normalize_formula_ocr(raw))
         return clean_inline_latex(raw)
 
     @staticmethod
@@ -564,7 +676,19 @@ class MinerUClient(RemoteParserClient):
                     page_idx = raw_item.get("page_idx")
                     if not isinstance(page_idx, int) or page_idx < 0:
                         continue
-                    text = cls._item_text(raw_item)
+                    source_raw_item = raw_item
+                    promoted_formula = (
+                        leading_latex_formula(str(raw_item.get("text", "") or ""))
+                        if str(raw_item.get("type", "")).casefold() == "text"
+                        else None
+                    )
+                    if promoted_formula:
+                        latex, formula_tail = promoted_formula
+                        raw_item = {**raw_item, "type": "equation", "text": latex}
+                        text = latex_to_text(latex)
+                    else:
+                        formula_tail = ""
+                        text = cls._item_text(raw_item)
                     item_type = str(raw_item.get("type", "")).casefold()
                     if item_type in {"header", "footer", "page_number", "discarded", "aside_text"}:
                         excluded_blocks.setdefault(page_idx + 1, []).append(
@@ -574,6 +698,7 @@ class MinerUClient(RemoteParserClient):
                                 text=str(raw_item.get("text", "") or ""),
                                 bbox=cls._bbox(raw_item),
                                 source_type=item_type,
+                                raw_item=raw_item,
                             )
                         )
                         continue
@@ -596,6 +721,7 @@ class MinerUClient(RemoteParserClient):
                                 page_number=page_number,
                                 block_type=cls._block_type(raw_item),
                                 text=text,
+                                raw_item=raw_item,
                                 table_html=(
                                     clean_inline_latex(str(raw_item.get("table_body", "")).strip())
                                     if item_type == "table"
@@ -614,13 +740,41 @@ class MinerUClient(RemoteParserClient):
                                     else None
                                 ),
                                 latex=(
-                                    _latex_if_real(raw_item)
+                                    formula_latex(raw_item)
                                     if item_type
                                     in {"equation", "interline_equation", "inline_equation"}
                                     else None
                                 ),
                             )
                         )
+                        if promoted_formula and formula_tail:
+                            tail_text = clean_inline_latex(formula_tail)
+                            if tail_text:
+                                page_parts.setdefault(page_number, []).append(tail_text)
+                                tail_item = {
+                                    **source_raw_item,
+                                    "type": "text",
+                                    "text": formula_tail,
+                                }
+                                tail_item.pop("img_path", None)
+                                tail_item.pop("image_path", None)
+                                page_blocks[page_number].append(
+                                    RemoteContentBlock(
+                                        page_number=page_number,
+                                        block_type="paragraph",
+                                        text=tail_text,
+                                        raw_item=tail_item,
+                                        bbox=cls._bbox(source_raw_item),
+                                        source_type="text_formula_tail",
+                                        text_level=(
+                                            source_raw_item.get("text_level")
+                                            if isinstance(
+                                                source_raw_item.get("text_level"), int
+                                            )
+                                            else None
+                                        ),
+                                    )
+                                )
                 if page_blocks or excluded_blocks:
                     break
 
@@ -640,6 +794,46 @@ class MinerUClient(RemoteParserClient):
             document_text=markdown.strip(),
             warnings=warnings + ([] if page_parts else ["MinerU result has no page-indexed text."]),
         )
+
+    def ocr_table_lines(self, pdf: bytes) -> list[dict[str, Any]]:
+        """Local crop OCR without the table model; retain independent line geometry."""
+        with self._client() as client:
+            response = client.post(
+                "file_parse",
+                data={
+                    "backend": self.settings.backend,
+                    "parse_method": "ocr",
+                    "lang_list": "ch",
+                    "table_enable": "false",
+                    "formula_enable": "false",
+                    "return_model_output": "true",
+                    "return_content_list": "true",
+                    "response_format_zip": "true",
+                },
+                files={"files": ("table-crop.pdf", pdf, "application/pdf")},
+                headers={"Accept": "application/zip"},
+                timeout=min(self.settings.timeout_seconds, 120),
+            )
+            response.raise_for_status()
+        with zipfile.ZipFile(BytesIO(response.content)) as archive:
+            members = archive.infolist()
+            if len(members) > MAX_REMOTE_ARCHIVE_MEMBERS or sum(
+                member.file_size for member in members
+            ) > MAX_REMOTE_ARCHIVE_BYTES:
+                raise ValueError("Table OCR archive exceeds safety limits")
+            names = [m.filename for m in members if m.filename.endswith("_model.json")]
+            if len(names) != 1:
+                return []
+            pages = json.loads(archive.read(names[0]))
+            if not isinstance(pages, list) or len(pages) != 1 or not isinstance(pages[0], dict):
+                return []
+            detections = pages[0].get("layout_dets", [])
+            if not isinstance(detections, list):
+                return []
+            return [
+                line for line in detections
+                if isinstance(line, dict) and line.get("label") == "ocr_text"
+            ]
 
     def _parse_request(
         self,

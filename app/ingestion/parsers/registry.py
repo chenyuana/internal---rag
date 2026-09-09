@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -11,6 +12,7 @@ from app.ingestion.parsers.base import ParserPlugin
 from app.ingestion.parsers.docx import DocxParser
 from app.ingestion.parsers.figure_vision import FigureVisionClient
 from app.ingestion.parsers.hybrid_pdf import HybridPdfParser
+from app.ingestion.parsers.llm_structure import LlmStructureAnnotator, build_annotator
 from app.ingestion.parsers.native_pdf import NativePdfParser
 from app.ingestion.parsers.remote import DoclingClient, MinerUClient
 from app.ingestion.parsers.scan_regulatory import (
@@ -26,9 +28,11 @@ class ParserRegistry:
         plugins: list[ParserPlugin],
         *,
         scan_parser: ParserPlugin | None = None,
+        structure_annotator: Any | None = None,
     ) -> None:
         self._plugins = plugins
         self._scan = scan_parser
+        self._structure = structure_annotator
 
     @classmethod
     def with_builtins(
@@ -52,7 +56,11 @@ class ParserRegistry:
             ),
         )
         scan = ScannedRegulatoryPdfParser(mineru)
-        return cls([hybrid, DocxParser()], scan_parser=scan)
+        annotator = (
+            build_annotator(resolved.llm_structure)
+            if resolved.llm_structure.enabled else None
+        )
+        return cls([hybrid, DocxParser()], scan_parser=scan, structure_annotator=annotator)
 
     @property
     def plugins(self) -> tuple[ParserPlugin, ...]:
@@ -89,5 +97,28 @@ class ParserRegistry:
     ) -> ParsedDocument:
         plugin = self.select(path)
         if isinstance(plugin, (HybridPdfParser, ScannedRegulatoryPdfParser)):
-            return plugin.parse(path, progress_callback=progress_callback)
-        return plugin.parse(path)
+            result = plugin.parse(path, progress_callback=progress_callback)
+        else:
+            result = plugin.parse(path)
+        if self._structure is not None:
+            warnings = self._structure.annotate_document(result)
+            self._structure_warnings = warnings
+        return result
+
+    @property
+    def structure_annotator(self) -> Any | None:
+        return self._structure
+
+    def set_structure_annotator(self, annotator: Any | None) -> None:
+        self._structure = annotator
+
+    def clear_structure_annotator(self) -> None:
+        self._structure = None
+
+    @property
+    def structure_warnings(self) -> list[str]:
+        return list(getattr(self, "_structure_warnings", []))
+
+    def close(self) -> None:
+        if isinstance(self._structure, LlmStructureAnnotator):
+            self._structure.close()

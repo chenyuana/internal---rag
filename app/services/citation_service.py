@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from app.schemas.retrieval import Citation, RetrievedChunk, SelectedChunk
+from app.services.citation_location import published_page_number
 from app.services.table_evidence import html_table_blocks
 
 
@@ -26,6 +27,16 @@ class CitationService:
         selected: list[SelectedChunk] = []
         citations: list[Citation] = []
         for index, chunk in enumerate(chunks, start=1):
+            if not chunk.metadata.page_number:
+                recovered_page = published_page_number(chunk.text)
+                if recovered_page:
+                    chunk = chunk.model_copy(
+                        update={
+                            "metadata": chunk.metadata.model_copy(
+                                update={"page_number": recovered_page}
+                            )
+                        }
+                    )
             citation_id = f"C{index}"
             table_htmls = html_table_blocks(chunk.text)
             table_html = next(iter(table_htmls), None)
@@ -40,6 +51,7 @@ class CitationService:
                     citation_id=citation_id,
                     chunk_id=chunk.chunk_id,
                     document_id=chunk.document_id,
+                    dataset_id=chunk.dataset_id,
                     document_name=chunk.metadata.document_name,
                     version=chunk.metadata.version,
                     source_path=chunk.metadata.source_path,

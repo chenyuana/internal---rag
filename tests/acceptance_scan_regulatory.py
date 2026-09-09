@@ -20,6 +20,7 @@ import pypdfium2 as pdfium
 
 from app.core.config import IngestionSettings, RemoteParserSettings, load_settings
 from app.ingestion.parsers.registry import ParserRegistry
+from app.ingestion.parsers.remote import MinerUClient
 from app.ingestion.pipeline import write_document
 
 
@@ -84,6 +85,11 @@ def main() -> None:
     parser.add_argument("--replay", type=Path)
     parser.add_argument("--replay-batches", type=Path, nargs="+")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--live-table-recovery",
+        action="store_true",
+        help="Replay page OCR but run real local crop OCR for table recovery",
+    )
     args = parser.parse_args()
     replay = bool(args.replay or args.replay_batches)
     if args.replay and args.replay_batches:
@@ -102,6 +108,10 @@ def main() -> None:
         transport = api_batch_transport(args.replay_batches, args.source)
     registry = ParserRegistry.with_builtins(settings, mineru_transport=transport)
     assert registry.select(args.source).name == "scan-regulatory-pdf"
+    if replay and args.live_table_recovery:
+        registry.select(args.source).mineru.ocr_table_lines = MinerUClient(
+            load_settings().ingestion.mineru
+        ).ocr_table_lines
     document = registry.parse(
         args.source,
         progress_callback=lambda done, total: print(f"OCR pages {done}/{total}", flush=True),
@@ -112,8 +122,36 @@ def main() -> None:
     excluded_ids = {b.block_id for b in document.blocks if b.block_type == "annotation"}
     indexed_ids = {b for c in document.chunks for b in c.block_ids}
     formula_blocks = [b for b in document.blocks if b.latex]
+    page5_text = "\n".join(b.text for b in document.blocks if b.page_number == 5)
+    page4_tables = [b for b in document.blocks if b.page_number == 4 and b.block_type == "table"]
+    expected_page4 = [
+        ["Item", "Tolerance"],
+        ["Weight", "+5%,-10%"],
+        ["Critical items affected by weight", "+5%,-1%"],
+        ["C.G.", "±7% total travel"],
+    ]
+    page4_rows = (
+        [[row[0], row[1].replace(", ", ",").rstrip(".")] for row in page4_tables[0].table_rows]
+        if len(page4_tables) == 1 and all(len(r) == 2 for r in page4_tables[0].table_rows)
+        else []
+    )
     checks = {
         "page_count_46": len(document.pages) == 46,
+        "page5_inline_climb_formula": (
+            "with a V_s0 of more than 70" in page5_text
+            and "at least 0.02 V_s0^2 (that is" in page5_text
+        ),
+        "page5_no_bold_command_corruption": "±b" not in page5_text,
+        "page4_exact_cells": page4_rows == expected_page4,
+        "page4_raw_evidence_retained": any(
+            i.get("raw_table_html") and i.get("table_review_status") == "recovered"
+            for i in document.pages[3].rich_blocks
+        ),
+        "page4_semantic_pairing": any(
+            "Item=C.G." in c.text and "Tolerance=±7% total travel." in c.text
+            for c in document.chunks
+            if c.page_start == 4
+        ),
         "page_content_coverage": document.qa["content_coverage"] == 1,
         "nonempty_chunks": bool(document.chunks),
         "handwritten_title_not_indexed": "See anrrie t ind" not in content,
@@ -146,6 +184,7 @@ def main() -> None:
         ),
         "replay_inputs": [str(p) for p in (args.replay_batches or [args.replay]) if p],
         "source_sha256": document.source_hash,
+        "live_table_recovery": args.live_table_recovery or not replay,
         "output_folder": output["output_folder"],
         "text_coverage": document.qa["text_coverage"],
         "content_coverage": document.qa["content_coverage"],
@@ -157,7 +196,7 @@ def main() -> None:
         "assets": len(document.assets),
         "quality_gates": document.qa["quality_gates"],
         "structural_acceptance": all(checks.values()),
-        "semantic_accuracy": "Requires visual review; OCR numeric cells are not auto-corrected.",
+        "semantic_accuracy": "Page 4 cells checked exactly; other tables still require review.",
     }
     (args.output / "acceptance.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"

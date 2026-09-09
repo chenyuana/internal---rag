@@ -13,6 +13,7 @@ from app.services.evidence_text import (
     split_requirements,
     split_sentences,
 )
+from app.services.regulation_context import regulation_context
 
 
 class EvidenceJudge:
@@ -27,6 +28,18 @@ class EvidenceJudge:
         chunks: list[SelectedChunk],
         coverage_matrix: list[CoverageCell] | None = None,
     ) -> EvidenceAssessment:
+        context = regulation_context(query, chunks)
+        if (
+            query.article_ids and context["evidence_sections"]
+            and len(context["unverified_sections"]) == len(query.article_ids)
+        ):
+            return EvidenceAssessment(
+                status="UNANSWERABLE",
+                missing_requirements=[
+                    "本次证据未核实所问条号，需核对条号与主题是否一致；"
+                    "不能据此认定条款不存在。"
+                ],
+            )
         if coverage_matrix:
             return self._assess_coverage_matrix(query, chunks, coverage_matrix)
         requirements = split_requirements(query.normalized_query)

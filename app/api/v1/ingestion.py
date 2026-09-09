@@ -6,11 +6,18 @@ from fastapi import APIRouter, File, Form, Header, Query, Response, UploadFile, 
 from fastapi.responses import FileResponse
 
 from app.api.dependencies import IngestionServiceDependency
+from app.ingestion.llm_structure_store import (
+    LlmStructureRuntimeConfig,
+    LlmStructureSettingsUpdate,
+    module_store,
+)
 from app.schemas.ingestion import (
     IngestionChunkUpdateRequest,
     IngestionChunkUpdateResult,
+    IngestionExportRequest,
     IngestionJob,
     IngestionPageDetail,
+    IngestionPageReprocessRequest,
     IngestionPreview,
     IngestionPublishRequest,
     IngestionQueueStatus,
@@ -38,6 +45,25 @@ async def get_ingestion_queue(
     return ingestion.queue_status()
 
 
+@router.get("/settings/llm-structure")
+async def get_llm_structure_settings(
+    user_id: UserIdHeader = "development-user",
+) -> dict:
+    """Return the operator's LLM structure-cleaning model config (key masked)."""
+    cfg = module_store.get(user_id)
+    return (cfg.public() if cfg else LlmStructureRuntimeConfig().public())
+
+
+@router.put("/settings/llm-structure")
+async def set_llm_structure_settings(
+    payload: LlmStructureSettingsUpdate,
+    user_id: UserIdHeader = "development-user",
+) -> dict:
+    """Store the operator's LLM structure-cleaning model config (process memory)."""
+    cfg = module_store.update(user_id, payload)
+    return cfg.public()
+
+
 @router.post(
     "/jobs",
     response_model=IngestionJob,
@@ -50,6 +76,7 @@ async def create_ingestion_job(
     source_relative_path: Annotated[str | None, Form()] = None,
     batch_id: Annotated[str | None, Form(max_length=100)] = None,
     sequence_in_batch: Annotated[int | None, Form(ge=0)] = None,
+    llm_structure_enabled: Annotated[bool, Form()] = False,
     user_id: UserIdHeader = "development-user",
 ) -> IngestionJob:
     job = await ingestion.create_job(
@@ -59,6 +86,7 @@ async def create_ingestion_job(
         batch_id=batch_id,
         sequence_in_batch=sequence_in_batch,
         created_by=user_id,
+        llm_structure_enabled=llm_structure_enabled,
     )
     await ingestion.enqueue(job.job_id)
     return job
@@ -124,6 +152,22 @@ async def update_ingestion_chunk(
         reason=request.reason,
         updated_by=user_id,
     )
+
+
+@router.post(
+    "/jobs/{job_id}/pages/{page_number}/reprocess",
+    response_model=IngestionJob,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def reprocess_ingestion_page(
+    job_id: str,
+    page_number: int,
+    request: IngestionPageReprocessRequest,
+    ingestion: IngestionServiceDependency,
+) -> IngestionJob:
+    job = await ingestion.reprocess_page(job_id, page_number, request.mode)
+    await ingestion.enqueue(job.job_id)
+    return job
 
 
 @router.patch(
@@ -217,4 +261,37 @@ async def publish_ingestion_job(
         job_id,
         dataset_id=request.dataset_id,
         dry_run=request.dry_run,
+    )
+
+
+@router.get("/jobs/{job_id}/export", response_class=Response)
+async def export_ingestion_job(
+    job_id: str,
+    ingestion: IngestionServiceDependency,
+    format: Annotated[str, Query()] = "zip",
+) -> Response:
+    content, filename, media_type = ingestion.export_job(job_id, format=format)
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "private, no-store, max-age=0",
+        },
+    )
+
+
+@router.post("/jobs/export", response_class=Response)
+async def export_ingestion_jobs(
+    request: IngestionExportRequest,
+    ingestion: IngestionServiceDependency,
+) -> Response:
+    content, filename, media_type = ingestion.export_jobs(request.job_ids)
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "private, no-store, max-age=0",
+        },
     )

@@ -14,7 +14,7 @@ from app.schemas.retrieval import SelectedChunk
 _PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
 _UNIT_RE = re.compile(
     r"\d+(?:\.\d+)?\s*(?:"
-    r"毫秒|ms|秒|s|分钟|min|小时|h|hz|khz|mhz|字节|bytes?"
+    r"英尺|英寸|节|磅|度|美元|毫秒|ms|秒|s|分钟|min|小时|h|hz|khz|mhz|字节|bytes?"
     r"|米|m|千米|km|厘米|cm|毫米|mm"
     r"|伏特|v|千伏|kv|安培|a|瓦特|w|公斤|kg|克|g|吨|t"
     r")",
@@ -46,10 +46,44 @@ _UNIT_ALIASES = {
     "小时": "h",
 }
 
+_BOUND_OPS = {
+    "at least": "ge", "not less than": "ge", "no less than": "ge",
+    "至少": "ge", "不少于": "ge", "不低于": "ge",
+    "at most": "le", "not more than": "le", "no more than": "le",
+    "至多": "le", "不超过": "le", "不大于": "le",
+    "greater than": "gt", "more than": "gt", "大于": "gt", "超过": "gt",
+    "less than": "lt", "小于": "lt", "低于": "lt",
+}
+_BOUND_RE = re.compile(
+    "(?P<op>" + "|".join(re.escape(op) for op in sorted(_BOUND_OPS, key=len, reverse=True))
+    + r")\s*(?P<quantity>\d[\d,.]*\s*(?:%|[A-Za-z]+|英尺|英寸|节|磅|度|米|秒|分钟))",
+    re.I,
+)
+
+
+def _bounds(text: str) -> set[tuple[str, str]]:
+    return {(_BOUND_OPS[match["op"].lower()], mark)
+            for match in _BOUND_RE.finditer(text)
+            for mark in _extract_numerical_marks(match["quantity"])}
+
 
 def _extract_numerical_marks(text: str) -> set[str]:
     """Extract normalized numeric assertions (percentages / unit values)."""
     normalized = unicodedata.normalize("NFKC", text)
+    normalized = re.sub(r"(?<=\d),(?=\d{3}(?:\D|$))", "", normalized)
+    # Unit aliases are lexical equivalences, not inferred conversions. Keep
+    # arbitrary new aircraft and clauses usable without per-document rules.
+    aliases = {
+        "feet": "英尺", "foot": "英尺", "ft": "英尺",
+        "inch": "英寸", "inches": "英寸", "knots": "节", "knot": "节",
+        "pounds": "磅", "pound": "磅", "lbs": "磅", "lb": "磅",
+        "degrees": "度", "degree": "度", "percent": "%",
+        "minutes": "分钟", "minute": "分钟", "seconds": "秒", "second": "秒",
+    }
+    for word, unit in aliases.items():
+        normalized = re.sub(
+            rf"(\d)\s*{word}\b", rf"\g<1>{unit}", normalized, flags=re.I,
+        )
     marks: set[str] = set()
     for match in _PERCENT_RE.finditer(normalized):
         marks.add(re.sub(r"\s+", "", match.group(0)))
@@ -93,6 +127,7 @@ class ClaimGroundingValidator:
         if not claim_marks:
             return
         supported: set[str] = set()
+        source_bounds: set[tuple[str, str]] = set()
         found_chunk = False
         for citation_id in claim.citation_ids:
             chunk = chunk_by_citation.get(citation_id)
@@ -100,11 +135,18 @@ class ClaimGroundingValidator:
                 found_chunk = True
                 supported |= _extract_numerical_marks(chunk.text)
                 supported |= self._table_encoded_marks(claim_marks, chunk.text)
+                source_bounds |= _bounds(chunk.text)
         if not found_chunk:
             # Nothing to ground against; unknown citation ids are the
             # CitationValidator's responsibility.
             return
         unsupported = claim_marks - supported
+        for op, mark in _bounds(claim.claim):
+            alternatives = {source_op for source_op, value in source_bounds if value == mark}
+            if alternatives and op not in alternatives:
+                raise ValueError(
+                    f"claim {claim.claim_id} reverses or changes the bound for {mark}"
+                )
         if not unsupported:
             return
         raise ValueError(

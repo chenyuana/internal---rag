@@ -309,7 +309,7 @@ async def test_exact_article_match_bypasses_similarity_threshold(
     assert execution.selected_chunks[0].chunk_id == "article"
     assert execution.stage_counts["article_exact_matches"] == 1
     assert fake_ragflow.request is not None
-    assert fake_ragflow.request.keyword is True
+    assert fake_ragflow.request.keyword is False
     assert "精确条号" in fake_ragflow.request.question
 
 

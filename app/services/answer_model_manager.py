@@ -155,7 +155,10 @@ class AnswerModelManager:
                     message="默认答案模型未启用。",
                     status_code=503,
                 )
-            settings = self._configured.model_copy(update={"model_name": selection.model_name})
+            update = {"model_name": selection.model_name}
+            if selection.thinking is not None:
+                update["thinking"] = selection.thinking
+            settings = self._configured.model_copy(update=update)
             return OnDemandAnswerModel(settings)
         async with self._lock:
             source = self._runtime.get(selection.source_id)
@@ -171,9 +174,10 @@ class AnswerModelManager:
                 message="所选模型不属于当前模型连接。",
                 status_code=400,
             )
-        return OnDemandAnswerModel(
-            source.settings.model_copy(update={"model_name": selection.model_name})
-        )
+        update = {"model_name": selection.model_name}
+        if selection.thinking is not None:
+            update["thinking"] = selection.thinking
+        return OnDemandAnswerModel(source.settings.model_copy(update=update))
 
     @staticmethod
     async def _discover(settings: ModelEndpointSettings) -> tuple[list[str], str | None]:

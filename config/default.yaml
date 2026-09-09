@@ -23,7 +23,10 @@ ragflow:
   base_url: ${RAGFLOW_BASE_URL:-http://localhost:9380}
   api_key: ${RAGFLOW_API_KEY:-}
   health_path: ${RAGFLOW_HEALTH_PATH:-/api/v1/system/healthz}
-  timeout_seconds: 10
+  # Query encoding can cold-start on the first request. Keep this configurable
+  # and long enough for local/CPU deployments instead of treating a healthy
+  # RAGFlow instance as unavailable after ten seconds.
+  timeout_seconds: ${RAGFLOW_TIMEOUT_SECONDS:-180}
   publish_timeout_seconds: ${RAGFLOW_PUBLISH_TIMEOUT_SECONDS:-120}
   publish_batch_size: ${RAGFLOW_PUBLISH_BATCH_SIZE:-16}
 
@@ -58,6 +61,15 @@ ingestion:
     model_name: ${FIGURE_VLM_MODEL_NAME:-qwen3.5:9b-q4_K_M}
     timeout_seconds: ${FIGURE_VLM_TIMEOUT_SECONDS:-300}
     max_output_tokens: ${FIGURE_VLM_MAX_OUTPUT_TOKENS:-800}
+  llm_structure:
+    enabled: ${LLM_STRUCTURE_ENABLED:-false}
+    base_url: ${LLM_STRUCTURE_BASE_URL:-https://api.deepseek.com/v1}
+    model: ${LLM_STRUCTURE_MODEL:-deepseek-v4-flash}
+    api_key: ${LLM_STRUCTURE_API_KEY:-}
+    timeout_seconds: ${LLM_STRUCTURE_TIMEOUT_SECONDS:-180}
+    page_batch_size: ${LLM_STRUCTURE_PAGE_BATCH_SIZE:-3}
+    max_tokens: ${LLM_STRUCTURE_MAX_TOKENS:-800}
+    temperature: ${LLM_STRUCTURE_TEMPERATURE:-0.0}
 
 access_control:
   mode: ${ACCESS_CONTROL_MODE:-deny_all}
@@ -70,19 +82,21 @@ models:
     base_url: ${ANSWER_MODEL_BASE_URL:-http://localhost:8000/v1}
     api_key: ${ANSWER_MODEL_API_KEY:-}
     model_name: ${ANSWER_MODEL_NAME:-Qwen3.5-9B}
+    thinking: ${ANSWER_MODEL_THINKING:-false}
     timeout_seconds: ${ANSWER_MODEL_TIMEOUT_SECONDS:-180}
     temperature: 0
     seed: 42
-    max_output_tokens: 2048
+    max_output_tokens: 8192
   verifier:
     enabled: ${VERIFIER_MODEL_ENABLED:-false}
     required: ${VERIFIER_MODEL_REQUIRED:-false}
     base_url: ${VERIFIER_MODEL_BASE_URL:-http://localhost:8001/v1}
     api_key: ${VERIFIER_MODEL_API_KEY:-}
     model_name: ${VERIFIER_MODEL_NAME:-Qwen3-4B-Instruct-2507}
+    thinking: ${VERIFIER_MODEL_THINKING:-false}
     timeout_seconds: 30
     temperature: 0
-    max_output_tokens: 1536
+    max_output_tokens: 4096
   embedding:
     enabled: ${EMBEDDING_MODEL_ENABLED:-false}
     required: ${EMBEDDING_MODEL_REQUIRED:-false}
@@ -167,6 +181,7 @@ retrieval:
   translated_query_weight: 0.85
 
 generation:
+  cross_language_generation: ${CROSS_LANGUAGE_GENERATION:-true}
   require_citations: true
   reject_on_no_evidence: true
   allow_partial_answer: true
@@ -185,6 +200,11 @@ generation:
   document_section_prompt_path: prompts/document_section_generation.txt
   document_section_prompt_version: document-section-generation-v1
   comparison_matrix_first: true
+  # 答案生成模式：deterministic（现状）/ llm（模型直接生成）
+  answer_mode: ${ANSWER_MODE:-deterministic}
+  # 确定性答案后再用模型通俗"讲一遍"（只转述、不新增）。
+  explain_enabled: ${ANSWER_EXPLAIN_ENABLED:-false}
+  explain_prompt_path: prompts/answer_explanation.txt
   # 8GB 本机优先零模型调用返回确定性矩阵；远程答案模型可按需开启。
   comparison_summary_enabled: false
   comparison_summary_timeout_seconds: 30

@@ -8,6 +8,7 @@ from app.ingestion.pipeline import (
     clean_page,
     detect_table_hints,
     extract_page_layout_features,
+    filter_federal_register_rich_blocks,
     filter_repeated_margin_rich_blocks,
     has_fake_glyph_corruption,
     has_low_quality_ocr_text,
@@ -379,6 +380,64 @@ def test_filter_repeated_margin_rich_blocks_keeps_body_and_tables() -> None:
     assert len(page.rich_blocks) == 2
 
 
+def test_filter_federal_register_rich_blocks_removes_header_and_footer() -> None:
+    # Vector/figure pages read the GPO running header (page number at the end)
+    # and the production footer as isolated blocks, plus tiny reversed footer
+    # fragments at the bottom margin. All must be removed; long legit lines
+    # that reach the bottom margin are preserved.
+    page = PageRecord(
+        page_number=4,
+        raw_text="",
+        rich_blocks=[
+            {
+                "block_type": "paragraph",
+                "text": "Federal Register/Vol. 74, No. 157/Monday, August 17, 2009/Proposed Rules 41525",
+                "bbox": [54.0, 72.26, 555.78, 81.27],
+            },
+            {
+                "block_type": "paragraph",
+                "text": "41536 Federal Register/Vol. 74, No. 157/Monday, August 17, 2009/Proposed Rules",
+                "bbox": [45.0, 33.77, 491.45, 44.77],
+            },
+            {
+                "block_type": "paragraph",
+                "text": "which include specific criteria for V , (M ) faster than Mach 0.6 to be",
+                "bbox": [45.0, 732.26, 559.38, 741.27],
+            },
+            {
+                "block_type": "paragraph",
+                "text": "no",
+                "bbox": [18.04, 745.37, 23.04, 750.93],
+            },
+            {
+                "block_type": "paragraph",
+                "text": "nosnibors",
+                "bbox": [18.04, 752.32, 23.04, 774.0],
+            },
+            {
+                "block_type": "paragraph",
+                "text": "VerDate Nov<24>2008 18:20 Aug 14, 2009 Jkt 217001 PO 00000 Frm 00005 Fmt 4701 Sfmt 4702 E:\\FR\\FM\\17AUP2.SGM 17AUP2",
+                "bbox": [25.0, 766.85, 450.24, 773.35],
+            },
+            {
+                "block_type": "table",
+                "text": "TABLE 1—ONE-ENGINE INOPERATIVE CLIMB REQUIREMENTS\nPistons | 1.0",
+                "bbox": [62.43, 227.45, 516.36, 438.36],
+            },
+        ],
+    )
+
+    removed = filter_federal_register_rich_blocks(page)
+
+    assert removed == 5
+    texts = [item.get("text") for item in page.rich_blocks]
+    assert all("Federal Register/Vol." not in text for text in texts)
+    assert all("VerDate" not in text for text in texts)
+    assert all(text.strip() not in {"no", "nosnibors"} for text in texts)
+    assert any("which include specific criteria" in text for text in texts)
+    assert any("TABLE 1" in text for text in texts)
+
+
 def test_is_fake_cjk_garbage_detects_extension_a_fake_glyphs() -> None:
     # 损坏字体把字母映射成 CJK 扩展 A 假字（犲 U+72B2），无 /G 字形名。
     fake = (
@@ -620,6 +679,241 @@ def test_clean_page_restores_fake_glyphs_in_body_text() -> None:
     assert "Pm=∑ni=Pi" in cleaned
 
 
+def test_clean_page_strips_federal_register_running_header_and_footer() -> None:
+    # Federal Register (GPO) pages carry a running header at the top and a
+    # print-run production stamp at the bottom. The stamp glues onto the last
+    # body line on single-stream pages and its "Frm" number changes every page,
+    # so the repeated-margin-key detector cannot catch it. Both must be removed
+    # while the real body text is preserved.
+    page = PageRecord(
+        page_number=1,
+        raw_text=(
+            "41522 Federal Register / Vol. 74, No. 157 / Monday, August 17, 2009 / Proposed Rules \n"
+            "DEPARTMENT OF TRANSPORTATION\n"
+            "The FAA established these special conditions.\n"
+            "the manufacturers and the FAA wanted part 23 turbojets to be similar to part 25 "
+            "VerDate Nov<24>2008 18:20 Aug 14, 2009 Jkt 217001 PO 00000 Frm 00002 Fmt 4701 Sfmt 4702 "
+            "E:\\FR\\FM\\17AUP2.SGM 17AUP2srobinson on DSKHWCL6B1PROD with PROPOSALS2\n"
+        ),
+        cleaned_text="",
+        route="native_text",
+        indexable=True,
+    )
+    cleaned, removed = clean_page(page, set())
+    assert "Federal Register / Vol." not in cleaned
+    assert "VerDate" not in cleaned
+    assert "with PROPOSALS2" not in cleaned
+    assert cleaned.startswith("DEPARTMENT OF TRANSPORTATION")
+    assert cleaned.endswith("to be similar to part 25")
+    assert removed == 1
+
+
+def test_clean_page_strips_federal_register_figure_page_footer() -> None:
+    # On figure pages the stamp, the <GPH> figure placeholder and the operator
+    # tail are emitted as separate lines after the last body line.
+    page = PageRecord(
+        page_number=22,
+        raw_text=(
+            "41545 Federal Register / Vol. 74, No. 157 / Monday, August 17, 2009 / Proposed Rules \n"
+            "Note: For Figure 2, time starts at the moment cabin altitude exceeds 10,000 feet.\n"
+            "VerDate Nov<24>2008 18:20 Aug 14, 2009 Jkt 217001 PO 00000 Frm 00031 Fmt 4701 Sfmt 4702 "
+            "E:\\FR\\FM\\17AUP2.SGM 17AUP2\n"
+            "EP17AU09.006</GPH>\n"
+            "srobinson on DSKHWCL6B1PROD with PROPOSALS2\n"
+        ),
+        cleaned_text="",
+        route="native_text",
+        indexable=True,
+    )
+    cleaned, removed = clean_page(page, set())
+    assert "VerDate" not in cleaned
+    assert "</GPH>" not in cleaned
+    assert "with PROPOSALS2" not in cleaned
+    assert cleaned.startswith("Note: For Figure 2")
+    assert removed == 4
+
+
+def test_clean_page_relocates_federal_register_footnote_to_page_end() -> None:
+    # Bottom-of-page footnotes are pulled to the page top by the text extractor
+    # and would otherwise glue onto the first body line. They must move to the
+    # end of the page while keeping the real citation.
+    page = PageRecord(
+        page_number=2,
+        raw_text=(
+            "41523 Federal Register / Vol. 74, No. 157 / Monday, August 17, 2009 / Proposed Rules \n"
+            "1 68 FR 5488 \n"
+            "business jets. Special conditions also addressed the following safety concerns:\n"
+            "Committee.1 Part 125 addresses the certification.\n"
+        ),
+        cleaned_text="",
+        route="native_text",
+        indexable=True,
+    )
+    cleaned, _removed = clean_page(page, set())
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    assert lines[0].startswith("business jets. Special conditions")
+    assert "Federal Register / Vol." not in cleaned
+    # The citation is kept, but now sits at the page end.
+    assert lines[-1] == "1 68 FR 5488"
+    assert "1 68 FR 5488 business jets" not in cleaned
+
+
+def test_clean_page_multi_footnote_relocation() -> None:
+    page = PageRecord(
+        page_number=5,
+        raw_text=(
+            "41526 Federal Register / Vol. 74, No. 157 / Monday, August 17, 2009 / Proposed Rules \n"
+            "2 58 FR 38028. \n"
+            "3 60 FR 65832 and 61 FR 2608. \n"
+            "takeoff requirements. Therefore, we propose to apply the requirements.\n"
+        ),
+        cleaned_text="",
+        route="native_text",
+        indexable=True,
+    )
+    cleaned, _removed = clean_page(page, set())
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    assert lines[0].startswith("takeoff requirements.")
+    assert lines[-2] == "2 58 FR 38028."
+    assert lines[-1] == "3 60 FR 65832 and 61 FR 2608."
+
+
+def test_strip_table_page_header_removes_running_header() -> None:
+    # Scanned regulatory pages carry a running header (doc-ID + date-time stamp)
+    # that the table extractor captures as the title and the head of row 1. It
+    # must be stripped so the block holds only real table content.
+    from app.ingestion.pipeline import _strip_table_page_header
+
+    title = "DRS\\_88-1"
+    rows = [
+        ["26/8/1810:4 DRS_88-1 Fuel", "13,080,000", "9,918,000"],
+        ["Certification, start up, and support equipment", "", ""],
+        ["(10 percent of equipment/installation)", "160,915,000", "119,228,000"],
+        ["Total", "", ""],
+    ]
+    stripped_title, stripped_rows, header_rows = _strip_table_page_header(title, rows)
+    assert stripped_title == ""
+    assert header_rows == 0
+    assert stripped_rows[0][0] == "Fuel"
+    assert stripped_rows[1][0] == "Certification, start up, and support equipment"
+    assert stripped_rows[3][0] == "Total"
+
+
+def test_clean_page_preserves_semantic_table_row_boundaries() -> None:
+    page = PageRecord(
+        page_number=1,
+        raw_text=(
+            "Parameters=Altitude; Range=-1,000 ft.; Sampling interval=1\n"
+            "Parameters=Heading; Range=360°; Sampling interval=1\n"
+            "Column 1=Total; Undiscounted=160,915,000; Discounted=119,228,000\n"
+        ),
+    )
+
+    cleaned, _ = clean_page(page, set())
+
+    assert cleaned.splitlines() == [
+        "Parameters=Altitude; Range=-1,000 ft.; Sampling interval=1",
+        "Parameters=Heading; Range=360°; Sampling interval=1",
+        "Column 1=Total; Undiscounted=160,915,000; Discounted=119,228,000",
+    ]
+
+
+def test_is_structural_continuation_merges_mid_data_table() -> None:
+    # A table split across a page boundary, whose continuation page lost its
+    # title/header to the running header, is still merged when the previous
+    # fragment ends mid-data and the next fragment opens with a data row.
+    from app.ingestion.pipeline import _is_structural_continuation
+
+    previous = {
+        "rows": [
+            ["", "Undiscounted", "Discounted", "Present value"],
+            ["Part 91-Airplanes", "130,805,000", "99,184,000", ""],
+        ]
+    }
+    fragment = {
+        "rows": [
+            ["Fuel", "13,080,000", "9,918,000", ""],
+            ["Total", "", "", ""],
+        ]
+    }
+    assert _is_structural_continuation(previous, fragment) is True
+
+
+def test_is_structural_continuation_rejects_terminated_table() -> None:
+    # A previous fragment that ends in a Total/summary row is a complete table,
+    # not a cross-page continuation; the next same-width fragment is separate.
+    from app.ingestion.pipeline import _is_structural_continuation
+
+    previous = {"rows": [["Total cost for all operating rules", "314,658,000", "222,339,000"]]}
+    fragment = {"rows": [["Fuel", "13,080,000", "9,918,000"], ["Total", "", ""]]}
+    assert _is_structural_continuation(previous, fragment) is False
+
+
+def test_is_structural_continuation_rejects_column_header_fragment() -> None:
+    # A continuation fragment whose first row is a fresh column header carries
+    # no data values, so it is not merged as a body-row continuation.
+    from app.ingestion.pipeline import _is_structural_continuation
+
+    previous = {"rows": [["", "Range", "Accuracy"], ["Main gear", "Discrete", ""]]}
+    fragment = {"rows": [["Parameters", "Range", "Accuracy"], ["Fuel", "13,080,000", ""]]}
+    assert _is_structural_continuation(previous, fragment) is False
+
+
+def test_is_structural_continuation_accepts_sparse_split_cell_residue() -> None:
+    from app.ingestion.pipeline import _is_structural_continuation
+
+    previous = {"rows": [["Airspeed", "As installed", "3%", "1", "1 kt."]]}
+    fragment = {
+        "rows": [
+            ["", "system", "", "", ""],
+            ["Heading", "360", "2", "1", "0.5"],
+        ]
+    }
+
+    assert _is_structural_continuation(previous, fragment) is True
+
+
+def test_is_structural_continuation_accepts_ordered_section_rows() -> None:
+    # FAA regulatory-summary tables have text-only cost/benefit cells. The
+    # increasing section identifier is the continuation signal even when no
+    # trailing cell contains a digit.
+    from app.ingestion.pipeline import _is_structural_continuation
+
+    previous = {
+        "rows": [[
+            "Section 23.729 Landing gear extension and retraction system.",
+            "para. (e). None... para. (g). Negligible, general practice.",
+            "Clarification. Minor; general practice",
+        ]]
+    }
+    fragment = {
+        "rows": [[
+            "Section 23.735 Brakes...",
+            "para. (a). None... para. (c). None... para. (e). $240 per certification.",
+            "Editorial clarification. Administrative. Minor safety.",
+        ]]
+    }
+
+    assert _is_structural_continuation(previous, fragment) is True
+
+
+def test_fragment_opens_with_column_header_detects_new_table() -> None:
+    # A fragment beginning with a label-only column-header row (no digits) is a
+    # new table; a fragment beginning with a body row is a continuation.
+    from app.ingestion.pipeline import _fragment_opens_with_column_header
+
+    assert _fragment_opens_with_column_header(
+        {"rows": [["Parameters", "Range", "Accuracy"], ["Fuel", "13,080,000", ""]]}
+    ) is True
+    assert _fragment_opens_with_column_header(
+        {"rows": [["Fuel consumption", "13,080,000", "9,918,000"], ["Total", "", ""]]}
+    ) is False
+    # A header whose first cell has a digit is treated as content, not a header.
+    assert _fragment_opens_with_column_header(
+        {"rows": [["Part 91-Airplanes", "130,805,000", "99,184,000"]]}
+    ) is False
+
+
 def test_table_to_markdown_renders_grid_with_header_separator() -> None:
     rows = [
         ["内容", None, "衡量指标", "数值范围", "一致性程度"],
@@ -652,6 +946,19 @@ def test_normalize_table_html_collapses_repeated_full_width_header() -> None:
     assert table_to_markdown(rows).splitlines()[0].count(title) == 1
     assert f'<th colspan="5">{title}</th>' in normalized
     assert "步骤3</td><td>步骤4" in normalized
+
+
+def test_normalize_table_html_repairs_concatenated_cell_attributes() -> None:
+    source = (
+        "<table><tr><td>Company</td><td>Revenue</td></tr>"
+        "<tr><tdrowspan=1colspan=1>Maule</td>"
+        "<tdrowspan=1colspan=1>$5,700,000</td></tr></table>"
+    )
+    normalized = normalize_table_html(source)
+    assert table_rows_from_html(normalized) == [
+        ["Company", "Revenue"],
+        ["Maule", "$5,700,000"],
+    ]
 
 
 def test_table_to_markdown_escapes_pipe_in_cell() -> None:

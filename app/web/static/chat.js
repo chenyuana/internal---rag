@@ -2,6 +2,7 @@
 
 const $ = (id) => document.getElementById(id);
 const escapeHtml = (value) => String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+const sanitizeTable = (html) => String(html ?? "").replace(/<script[\s\S]*?<\/script>/gi, "").replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*')/gi, "");
 const STORAGE_KEY = "internal-rag.chat-conversations.v1";
 const STATUS_NAMES = { ANSWERABLE: "资料充分", PARTIALLY_ANSWERABLE: "部分可回答", UNANSWERABLE: "资料不足", CONFLICTED: "证据冲突" };
 
@@ -14,7 +15,18 @@ function uid() { return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}
 function activeConversation() { return state.conversations.find((item) => item.id === state.activeId); }
 function newConversationObject() { const now = new Date().toISOString(); return { id: uid(), title: "新对话", createdAt: now, updatedAt: now, kbId: state.selectedKbId, auxiliaryDocument: null, messages: [] }; }
 function compactAnswer(data) {
-  return { ...data, diagnostics: undefined, citations: (data.citations || []).map(({ table_html, table_htmls, ...citation }) => citation) };
+  return {
+    ...data,
+    diagnostics: undefined,
+    citations: (data.citations || []).map((citation) => {
+      const tables = Array.isArray(citation.table_htmls) && citation.table_htmls.length
+        ? citation.table_htmls
+        : citation.table_html
+          ? [citation.table_html]
+          : [];
+      return { ...citation, table_htmls: tables, table_html: undefined };
+    }),
+  };
 }
 
 async function readJson(response) {
@@ -137,13 +149,27 @@ function renderLoading() { const article = document.createElement("article"); ar
 function answerForMessage(id) { return activeConversation()?.messages.find((item) => item.id === id && item.role === "assistant"); }
 function selectAnswer(id, citationId = null) {
   const answer = answerForMessage(id); if (!answer?.data) return; renderCitations(answer.data.citations || [], id);
+  if (citationId) {
+    const citation = answer.data.citations?.find((item) => item.citation_id === citationId);
+    if (citation) window.CitationPdf.open(citation, activeConversation()?.kbId);
+  }
   if (citationId) requestAnimationFrame(() => { const target = document.getElementById(`evidence-${citationId}`); if (target) { target.classList.add("active"); target.scrollIntoView({ behavior: "smooth", block: "nearest" }); } });
 }
 
 function renderCitations(citations, answerId) {
+  citations = citations.map((citation) => ({...citation,
+    page_number: window.CitationPdf.resolvePageNumber(citation)}));
   $("evidenceCount").textContent = String(citations.length); $("evidenceIntro").textContent = citations.length ? "点击回答中的引用编号，可定位到对应原文。" : "当前回答没有可展示的引用证据。";
   const list = $("citationsList"); list.innerHTML = "";
-  citations.forEach((citation) => { const item = document.createElement("li"); item.className = "citation-card"; item.id = `evidence-${citation.citation_id}`; item.dataset.answerId = answerId || ""; const quote = String(citation.quote || "").replace(/\s+/g, " ").trim().slice(0, 520); const path = [citation.chapter_path, citation.version].filter(Boolean).join(" · "); item.innerHTML = `<div class="cite-top"><span class="cite-id">[${escapeHtml(citation.citation_id)}]</span><span class="cite-page">${citation.page_number ? `第 ${citation.page_number} 页` : ""}</span></div><span class="cite-doc">${escapeHtml(citation.document_name || citation.document_id || "未知文档")}</span>${path ? `<span class="cite-path">${escapeHtml(path)}</span>` : ""}${quote ? `<span class="cite-quote">${escapeHtml(quote)}${quote.length >= 520 ? "…" : ""}</span>` : ""}`; list.appendChild(item); });
+  citations.forEach((citation) => { const item = document.createElement("li"); item.className = "citation-card"; item.id = `evidence-${citation.citation_id}`; item.dataset.answerId = answerId || ""; const quote = String(citation.quote || "").replace(/\s+/g, " ").trim(); const path = [citation.chapter_path, citation.version].filter(Boolean).join(" · "); const tables = (Array.isArray(citation.table_htmls) ? citation.table_htmls : []).map(sanitizeTable).filter(Boolean).join(""); item.innerHTML = `<div class="cite-top"><span class="cite-id">[${escapeHtml(citation.citation_id)}]</span><span class="cite-page">${citation.page_number ? `第 ${citation.page_number} 页` : ""}</span></div><span class="cite-doc">${escapeHtml(citation.document_name || citation.document_id || "未知文档")}</span>${path ? `<span class="cite-path">${escapeHtml(path)}</span>` : ""}${quote ? `<span class="cite-quote">${escapeHtml(quote)}</span>` : ""}${tables ? `<div class="cite-tables">${tables}</div>` : ""}`; list.appendChild(item); });
+  citations.forEach((citation, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "text-button";
+    button.textContent = "打开 PDF 原文";
+    button.addEventListener("click", () => selectAnswer(answerId, citation.citation_id));
+    list.children[index].appendChild(button);
+  });
 }
 
 async function sendQuestion() {
@@ -156,7 +182,7 @@ async function sendQuestion() {
     const referenceDocument = state.referenceDocument
       ? { name: state.referenceDocument.name, text: state.referenceDocument.text }
       : null;
-    const response = await fetch("/api/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", "X-User-ID": "dev" }, body: JSON.stringify({ query: question, knowledge_base_ids: [state.selectedKbId], conversation_id: conversation.id, model: state.selectedModel, reference_document: referenceDocument }) });
+    const response = await fetch("/api/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", "X-User-ID": "dev" }, body: JSON.stringify({ query: question, knowledge_base_ids: [state.selectedKbId], conversation_id: conversation.id, model: { ...state.selectedModel, thinking: $("thinkingToggle").checked }, reference_document: referenceDocument }) });
     const data = compactAnswer(await readJson(response)); conversation.messages.push({ id: uid(), role: "assistant", data, createdAt: new Date().toISOString() });
   } catch (error) {
     conversation.messages.push({ id: uid(), role: "assistant", error: true, data: { status: "UNANSWERABLE", answer: `请求失败：${error.message}`, citations: [] }, createdAt: new Date().toISOString() });
