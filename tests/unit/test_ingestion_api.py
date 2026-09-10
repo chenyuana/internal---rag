@@ -170,8 +170,8 @@ def test_ingestion_interface_and_assets_are_available(client: TestClient) -> Non
     assert 'id="recleanPageButton"' in interface.text
     assert 'id="reocrPageButton"' in interface.text
     assert 'id="pageActionHint"' in interface.text
-    assert "/assets/ingestion.js?v=20260901-page-reprocess-1" in interface.text
-    assert "/assets/ingestion.css?v=20260901-page-reprocess-1" in interface.text
+    assert "/assets/ingestion.js?v=20260910-publish-preview-1" in interface.text
+    assert "/assets/ingestion.css?v=20260909-page-dialog-2" in interface.text
     assert 'id="folderInput"' in interface.text
     assert "webkitdirectory" in interface.text
     assert 'id="selectFilesButton"' in interface.text
@@ -374,6 +374,30 @@ def test_manual_confirmation_can_override_failed_quality_gate(
     assert refreshed["review"]["quality_gate_override"] is False
     assert refreshed["review"]["overridden_quality_gates"] == []
     assert refreshed["review"]["quality_gate_overridden_at"] is None
+
+
+def test_publish_preview_matches_the_uploaded_payload(client: TestClient, settings) -> None:
+    """The workbench preview must render the same fragments RAGFlow receives.
+
+    Regression: the panel used to re-derive the prefix in JavaScript and omit
+    the ``检索锚点`` line, so an operator could not see the keywords that were
+    actually uploaded.
+    """
+    seed_editable_job(settings)
+
+    chunk = client.get("/api/v1/ingestion/jobs/editable-job/preview").json()["chunks"][0]
+    page = client.get("/api/v1/ingestion/jobs/editable-job/pages/2").json()["chunks"][0]
+    plan = client.post(
+        "/api/v1/ingestion/jobs/editable-job/publish",
+        json={"dataset_id": "kb-regulations", "dry_run": True},
+    ).json()["plan"]
+
+    assert plan["chunk_count"] == 1
+    payload = plan["sample_payloads"][0]
+    for view in (chunk, page):
+        assert view["ragflow_content"] == payload["content"]
+        assert view["ragflow_important_keywords"] == payload["important_keywords"]
+    assert chunk["ragflow_content"].startswith("文档：editable.pdf")
 
 
 def test_quality_gate_override_only_applies_to_approval(

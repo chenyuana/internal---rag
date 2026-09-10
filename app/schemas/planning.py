@@ -39,7 +39,7 @@ class QueryPlanV2(BaseModel):
 
     version: Literal["query-plan-v2"] = "query-plan-v2"
     query_type: Literal[
-        "fact", "summary", "comparison", "multi_hop", "procedure", "unknown"
+        "fact", "summary", "comparison", "multi_hop", "procedure", "enumeration", "unknown"
     ]
     subjects: list[str] = Field(default_factory=list, max_length=4)
     aspects: list[str] = Field(default_factory=list, max_length=8)

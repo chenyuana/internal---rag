@@ -27,6 +27,7 @@ from app.ingestion.regulations import (
     build_question_aliases,
     extract_keywords,
     match_article_heading,
+    table_lead_in_line,
 )
 from app.ingestion.regulatory_structure import expand_regulatory_blocks
 
@@ -2372,12 +2373,15 @@ def is_glyph_name_garbage(text: str) -> bool:
         return False
 
     # Some PDF fonts expose decimal glyph names (/0/1/2.../i255),
-    # rather than /Gxx. Require long dense runs and many distinct names so
-    # dates, paths, fractions and ordinary slash-separated values stay native.
+    # rather than /Gxx. Require dense runs and many distinct names so dates,
+    # paths, fractions and ordinary slash-separated values stay native. A
+    # complete page header/footer glyph stream can contain fewer than 40 names
+    # (as in FAA DRS PDFs), so 40 was too high: it accepted an entire corrupt
+    # page as genuine text and silently skipped OCR.
     numeric_runs = re.findall(r"(?:/(?:i?\d{1,5})(?=/|$)){12,}", compact)
     numeric_names = re.findall(r"/(i?\d+)", "".join(numeric_runs))
     if (
-        len(numeric_names) >= 40
+        len(numeric_names) >= 24
         and sum(map(len, numeric_runs)) / total > 0.5
         and len(set(numeric_names)) >= 10
     ):
@@ -2409,6 +2413,74 @@ def is_glyph_name_garbage(text: str) -> bool:
         return False
 
     return len(glyph_matches) >= 5
+
+
+def is_margin_only_corrupt_page(
+    pdf_page: Any,
+    raw_text: str,
+    layout_features: dict[str, Any],
+) -> bool:
+    """Identify an actually blank page whose only text is corrupt margins.
+
+    Some Federal Register source PDFs alternate a substantive raster page with
+    a blank page containing only generated header/footer text. Their broken
+    embedded font makes the two margins look like a long glyph-name stream,
+    which previously sent the blank page to OCR and then retained the stream
+    when OCR correctly returned no content. Do not treat a page as blank
+    merely because its text is corrupt: require all three independent signals:
+    short drawing content, no substantive raster, and every extractable text
+    fragment positioned in a top/bottom margin.
+    """
+
+    if not raw_text or not is_glyph_name_garbage(raw_text):
+        return False
+
+    try:
+        contents = pdf_page.get_contents()
+        content_bytes = len(contents.get_data()) if contents is not None else 0
+    except Exception:
+        return False
+    # Outlined body text and vector drawings are far larger than the small
+    # page shell used for header/footer-only sheets. Keep the threshold low:
+    # an uncertain sparse page should still go through OCR rather than vanish.
+    if content_bytes > 12_000:
+        return False
+
+    for image in layout_features.get("image_sizes", []):
+        try:
+            width = float(image.get("width", 0.0))
+            height = float(image.get("height", 0.0))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if width >= 100 and height >= 100:
+            return False
+
+    try:
+        page_height = float(pdf_page.mediabox.height)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if page_height <= 0:
+        return False
+
+    y_positions: list[float] = []
+
+    def visitor(text: str, _cm: Any, tm: Any, _font: Any, _size: Any) -> None:
+        if not text.strip():
+            return
+        try:
+            y_positions.append(float(tm[5]))
+        except (IndexError, TypeError, ValueError):
+            return
+
+    try:
+        pdf_page.extract_text(visitor_text=visitor)
+    except Exception:
+        return False
+    if not y_positions:
+        return False
+
+    margin = page_height * 0.1
+    return all(y <= margin or y >= page_height - margin for y in y_positions)
 
 
 def is_fake_cjk_garbage(text: str) -> bool:
@@ -2914,6 +2986,12 @@ def filter_federal_register_rich_blocks(page: PageRecord) -> int:
 
 
 def heading_kind(text: str) -> str | None:
+    normalized = normalize_line(text)
+    if _APPENDIX_BANNER_RE.fullmatch(normalized):
+        # Federal Register appendix banner ("APPENDIX I COMMITTEE IV
+        # (POWERPLANT) PROPOSALS DEFERRED GROUP 1"). It is an annex heading
+        # even though it carries no "—" separator or "to Part N".
+        return "annex"
     if re.fullmatch(
         r"Appendix\s+[A-Z0-9]+\s+(?:to\s+Part\s+\d+\s*)?[—–-].{1,160}",
         normalize_line(text), re.I,
@@ -3223,6 +3301,319 @@ def detect_repeated_margin_lines(pages: list[PageRecord]) -> set[str]:
     return {key for key, count in candidates.items() if count >= minimum_hits}
 
 
+# Browser-printed PDFs carry a running "about:blank 28/35" footer that the
+# vector/native extractors append to the last body line of the page instead of
+# keeping it in the margin. Left in place it is published inside a chunk's text
+# (57 of the stored documents contain it, up to 88 times each).
+_VECTOR_PAGE_FOOTER_RE = re.compile(r"about:blank\s*\d+\s*/\s*\d+", re.IGNORECASE)
+
+# Federal Register appendix banners are printed in full caps and name both the
+# appendix and the committee, e.g. "APPENDIX I COMMITTEE IV (POWERPLANT)
+# PROPOSALS DEFERRED GROUP 1".  Extraction glues such a banner to the sentence
+# before it ("... Agenda Item P-84.APPENDIX I COMMITTEE IV ...") and to the
+# sentence after it ("... GROUP 1 Based upon the discussions ..."), so the
+# heading event is lost and the whole appendix -- its title page and its
+# proposal tables -- inherits the section of the part that merely preceded it
+# (Docket 75-19 pp. 28-31).
+_APPENDIX_BANNER_TOKEN = r"\(?[A-Z0-9][A-Z0-9()/\-]*(?![A-Za-z])"
+_APPENDIX_BANNER_RE = re.compile(
+    rf"APPENDIX\s+(?:[IVXLC]+|\d+|[A-Z])(?:\s+{_APPENDIX_BANNER_TOKEN}){{1,15}}"
+)
+# The banner must close the preceding sentence and open the next one. A
+# mid-sentence citation ("See APPENDIX I for details") ends in a lower-case
+# word and is rejected, as is a run of all-caps body prose.
+_BANNER_HEAD_BOUNDARY_RE = re.compile(r"[.;:!?—–]\s*$")
+_BANNER_TAIL_START_RE = re.compile(r"^[A-Z0-9(]")
+
+
+def split_appendix_banner(text: str) -> tuple[str, str, str] | None:
+    """Split a glued appendix banner out of ``text`` as ``(head, banner, tail)``.
+
+    Returns ``None`` when the text carries no banner. Callers keep the head and
+    tail as ordinary prose and the banner as an annex heading, which resets the
+    running section for everything that follows.
+    """
+    for match in _APPENDIX_BANNER_RE.finditer(text):
+        head = text[: match.start()].rstrip()
+        tail = text[match.end() :].lstrip()
+        if head and not _BANNER_HEAD_BOUNDARY_RE.search(head):
+            continue
+        if tail and not _BANNER_TAIL_START_RE.match(tail):
+            continue
+        return head, match.group(0).strip(), tail
+    return None
+
+
+# A label line is an all-caps label followed by a colon, with its value either
+# on the same line ("DATES: Comments must be received...") or on the following
+# lines ("SUPPLEMENTARY INFORMATION:"). Federal Register notices print their
+# division headers this way (SUMMARY / DATES / ADDRESSES / SUPPLEMENTARY
+# INFORMATION / EFFECTIVE DATE), and so does the notice's own masthead (CFR
+# NPRM / CITATION / DOCKET NUMBER / SUBJECT / ACTION) -- the two are
+# typographically identical, so which is which is decided by *position* in the
+# document, not by a list of names.
+_LABEL_LINE_RE = re.compile(
+    r"^(?P<label>[A-Z][A-Z0-9 ,.&'’()/\-]{1,48}):(?P<body>.*)$"
+)
+
+
+def split_label_line(text: str) -> tuple[str, str] | None:
+    """Split a label line into ``(label, body)``; body may be empty."""
+    match = _LABEL_LINE_RE.match(text.strip())
+    if match is None:
+        return None
+    return match.group("label").strip() + ":", match.group("body").strip()
+
+
+def is_bare_label(text: str) -> bool:
+    """True for "LABEL:" with no inline value."""
+    parts = split_label_line(text)
+    return parts is not None and not parts[1]
+
+
+# A metadata block ends when the notice's narrative starts.  The threshold is
+# deliberately high: the masthead's values wrap onto their own lines
+# ("31|Part 33|Part 35"), and those fragments must not close the block.
+_METADATA_NARRATIVE_WORDS = 12
+
+
+def _is_narrative(text: str) -> bool:
+    return len(re.findall(r"[A-Za-z\u3400-\u9fff]+", text)) >= _METADATA_NARRATIVE_WORDS
+
+
+# A heading that wraps onto the next printed line loses its tail.  Docket 75-31
+# p. 68 prints "APPENDIX III - MISCELLANEOUS PROPOSALS REMOVED FROM CONSIDERATION
+# FROM THE" / "FIRST BIENNIAL AIRWORTHINESS REVIEW"; without joining the two the
+# section label stops mid-phrase and the tail line is free to be mistaken for a
+# table caption.  The wrap is recognizable by shape alone: an all-caps line that
+# stops on a connector word, continued by another all-caps line.
+_HEADING_CONNECTOR_RE = re.compile(
+    r"\b(?:THE|OF|AND|FOR|TO|IN|ON|FROM|BY|WITH|AS|A|AN)\s*$"
+)
+_WRAPPED_HEADING_MAX_CHARS = 200
+
+
+def _is_all_caps_line(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and not re.search(r"[a-z]", stripped) and bool(
+        re.search(r"[A-Z]", stripped)
+    )
+
+
+def _continues_heading(line: str, following: str) -> bool:
+    """Does ``following`` complete the heading ``line`` starts?"""
+    first = line.strip()
+    second = following.strip()
+    if not first or not second:
+        return False
+    if not _is_all_caps_line(first) or not _is_all_caps_line(second):
+        return False
+    if not _HEADING_CONNECTOR_RE.search(first):
+        return False
+    return len(f"{first} {second}") <= _WRAPPED_HEADING_MAX_CHARS
+
+
+def _join_wrapped_heading_lines(lines: list[str]) -> list[str]:
+    """Join a heading that the printer wrapped onto the next line."""
+    joined: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        following = lines[index + 1] if index + 1 < len(lines) else ""
+        if _continues_heading(line, following):
+            joined.append(f"{line.strip()} {following.strip()}")
+            index += 2
+            continue
+        joined.append(line)
+        index += 1
+    return joined
+
+
+_HEADINGLESS_BLOCK_TYPES = frozenset({"table", "table_coverage", "figure"})
+
+
+def _join_wrapped_heading_parts(
+    page_parts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Same join as ``_join_wrapped_heading_lines`` for rich (vector) blocks."""
+    joined: list[dict[str, Any]] = []
+    index = 0
+    while index < len(page_parts):
+        item = page_parts[index]
+        following = page_parts[index + 1] if index + 1 < len(page_parts) else None
+        if (
+            following is not None
+            and str(item.get("block_type") or "").casefold() not in _HEADINGLESS_BLOCK_TYPES
+            and str(following.get("block_type") or "").casefold()
+            not in _HEADINGLESS_BLOCK_TYPES
+            and _continues_heading(
+                str(item.get("text", "")), str(following.get("text", ""))
+            )
+        ):
+            text = f"{str(item.get('text', '')).strip()} {str(following.get('text', '')).strip()}"
+            merged = {**item, "text": text}
+            kind = heading_kind(text)
+            if kind is not None:
+                merged["block_type"] = kind
+            joined.append(merged)
+            index += 2
+            continue
+        joined.append(item)
+        index += 1
+    return joined
+
+
+def _split_inline_heading_prefixes(
+    page_parts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Emit inline heading prefixes as their own parts.
+
+    Two shapes arrive glued to the text around them: an appendix banner
+    ("… Agenda Item P-84.APPENDIX I COMMITTEE IV …") and a label with its body
+    on one line ("DATES: Comments must be received…").  Splitting is decided by
+    shape only; whether a label is a division or document metadata is decided
+    later, where the document's position is known (``split_blocks``).
+    """
+    expanded: list[dict[str, Any]] = []
+    for item in page_parts:
+        block_type = str(item.get("block_type") or "").casefold()
+        if block_type in {"table", "table_coverage", "figure"}:
+            # A table's semantic text is content, not a heading event.
+            expanded.append(item)
+            continue
+        remaining = str(item.get("text", ""))
+        if not remaining:
+            expanded.append(item)
+            continue
+        if heading_kind(remaining) is not None:
+            # Already a heading as written ("PART 23 -- AIRWORTHINESS
+            # STANDARDS: NORMAL, UTILITY, ..."): its label and its value are one
+            # section title, so do not split them apart.
+            expanded.append(item)
+            continue
+        label_line = split_label_line(remaining)
+        if label_line is not None and label_line[1]:
+            label, body = label_line
+            expanded.append(
+                {**item, "text": label, "label_inline": True, "label_body": body}
+            )
+            remaining = body
+        while remaining:
+            split = split_appendix_banner(remaining)
+            if split is None:
+                break
+            head, banner, tail = split
+            if head:
+                expanded.append({**item, "text": head})
+            expanded.append({**item, "text": banner, "block_type": "annex"})
+            remaining = tail
+        if remaining:
+            expanded.append({**item, "text": remaining})
+    return expanded
+
+
+def _page_appendix_banner(page_parts: list[dict[str, Any]]) -> str | None:
+    """Return the appendix banner a page's table caption carries, if any.
+
+    Vector extraction sometimes keeps the banner only as the table's caption,
+    so a page's own prose -- which precedes that table -- would otherwise
+    inherit the previous part's section (Docket 75-19 p. 30: "APPENDIX II
+    COMMITTEE IV (POWERPLANT) PROPOSALS WITHDRAWN BY PROPONENT" printed above
+    the withdrawn-proposal table).
+    """
+    texts = {str(item.get("text", "")).strip() for item in page_parts}
+    for item in page_parts:
+        if str(item.get("block_type") or "").casefold() != "table":
+            continue
+        title = str(item.get("table_title") or "").strip()
+        if title and title not in texts and _APPENDIX_BANNER_RE.fullmatch(
+            normalize_line(title)
+        ):
+            return title
+    return None
+
+
+def _title_repeats_section(title: str, section_path: Iterable[str]) -> bool:
+    """Is this table title already part of the section label above the table?
+
+    A wrapped heading hands its tail line to the table as a caption.  Promoting
+    that fragment replaces a complete section label with half of it -- Docket
+    75-31 p. 68 published the appendix table under "FIRST BIENNIAL AIRWORTHINESS
+    REVIEW" instead of the whole APPENDIX III heading.
+    """
+    key = re.sub(r"[^a-z0-9]+", "", title.casefold())
+    if len(key) < 6:
+        return False
+    return any(
+        key in re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+        for value in section_path
+    )
+
+
+def _is_fragment_table_title(title: str, previous_text: str) -> bool:
+    """Is this "caption" really the wrapped tail of the sentence above it?
+
+    Vector extraction hands the last line before a table over as its caption.
+    When that line merely continues the previous paragraph -- "In addition to
+    Notice No. 74-33, the following Airworthiness Review Program Notices of" /
+    "Proposed Rule Making have been issued:" -- publishing it as the table's
+    section replaces the real section with a sentence fragment.
+    """
+    if not title.endswith(":"):
+        return False
+    previous = previous_text.strip()
+    return bool(previous) and not re.search(r"[.;:!?]$", previous)
+
+
+def _document_table_value_keys(pages: list[PageRecord]) -> frozenset[str]:
+    """Compact forms of every table cell in the document.
+
+    Appendix tables are often grouped by proponent, and the group label prints
+    where a caption would. Comparing a table's supposed caption against this
+    vocabulary tells a real caption from the table's own data (see
+    ``_is_data_derived_table_title``).
+    """
+    keys: set[str] = set()
+    for page in pages:
+        for item in page.rich_blocks:
+            rows = item.get("table_rows")
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, (list, tuple)):
+                    continue
+                for cell in row:
+                    text = str(cell).strip()
+                    if len(text) >= 6:
+                        keys.add(re.sub(r"[^a-z0-9]+", "", text.casefold()))
+    return frozenset(keys)
+
+
+def _is_data_derived_table_title(title: str, value_keys: frozenset[str]) -> bool:
+    """Is this "caption" a truncated value from one of the document's tables?
+
+    Docket 75-31 p. 65: the appendix table is grouped by proponent, and the
+    group label "General Aviation Manufacturers" (printed above that page's rows
+    and extracted as the caption) is a truncated form of the value
+    "General Aviation Manufacturers Association." in the table itself. Promoting
+    it to ``section_path`` displaced the real section -- the whole table was
+    published under a proponent's name instead of "APPENDIX I - MISCELLANEOUS
+    PROPOSALS DEFERRED.".
+
+    The test is a *derivation* test, not a word list: the caption must be a
+    leading part of a value that covers it almost entirely. Across the 90 stored
+    table titles only three match, and all three are this defect; the nearest
+    real caption scores far below the threshold.
+    """
+    key = re.sub(r"[^a-z0-9]+", "", title.casefold())
+    if len(key) < 6:
+        return False
+    return any(
+        len(value) > len(key) and value.startswith(key) and len(key) / len(value) >= 0.6
+        for value in value_keys
+    )
+
+
 def clean_page(page: PageRecord, repeated_margin_keys: set[str]) -> tuple[str, int]:
     kept: list[str] = []
     footnotes: list[str] = []
@@ -3292,8 +3683,37 @@ def clean_page(page: PageRecord, repeated_margin_keys: set[str]) -> tuple[str, i
             buffer.clear()
 
     annex_title_pending = False
+    kept = _join_wrapped_heading_lines(kept)
     for line in kept:
+        line = _VECTOR_PAGE_FOOTER_RE.sub(" ", line).strip()
+        if not line:
+            removed += 1
+            continue
+        glued_banner = split_appendix_banner(line)
+        if glued_banner is not None:
+            # Keep the banner on its own line so the appendix heading is not
+            # published as part of the paragraph that happens to precede it.
+            head, banner, tail = glued_banner
+            if head:
+                buffer.append(head)
+            flush()
+            paragraphs.append(banner)
+            annex_title_pending = False
+            if tail:
+                buffer.append(tail)
+                if re.search(r"[。！？；;:]$", tail):
+                    flush()
+            continue
         kind = heading_kind(line)
+        if kind is None and split_label_line(line) is not None:
+            # A label line must stay a line: joining it with its neighbours
+            # ("...ACTION: Proposed Rules SUMMARY:") hides the label, and the
+            # block stage can then no longer tell masthead metadata from a
+            # division header. Position decides that, not this pass.
+            flush()
+            paragraphs.append(line)
+            annex_title_pending = False
+            continue
         semantic_table_line = bool(
             re.match(r"^(?:Columns?\s+\d+(?:-\d+)?|Parameters)=", line)
             or line.count("=") >= 2
@@ -3393,6 +3813,32 @@ def split_blocks(
     # clause/annex/chapter switches the active clause.
     unnumbered_parent_stack: list[str] = []
 
+    # A Federal Register notice opens with a masthead ("CFR NPRM: ... ACTION:
+    # Proposed Rules SUMMARY: ...") whose label lines are typographically
+    # identical to the division headers that follow ("SUPPLEMENTARY
+    # INFORMATION:"). Shape alone cannot separate them, so the state machine
+    # below uses position: the masthead is open at the start of the document and
+    # closes at the first label that is a bare label (its value on the following
+    # lines) or at the first line of ordinary narrative.
+    #
+    # Measured trade (72-document A/B, 2026-09-10): position alone recovers
+    # division labels that no name list contained ("NPRM ACTIONS:",
+    # "REGULATORY TEXT:", "TERMINATION DATE:") at the cost of promoting a few
+    # masthead labels in compilation PDFs that bind several notices. The
+    # distinction is semantic, which position can only approximate; the planned
+    # replacement is to let the ingestion LLM structure pass mark each label
+    # masthead/division, leaving this as the fallback when no model is
+    # configured.
+    metadata_open = True
+    # Values of every table in the document, to tell a real caption from a
+    # group label that belongs to the table's own data.
+    table_value_keys = _document_table_value_keys(pages)
+    # Compilations bind several notices into one PDF, so the label that opens
+    # the document opens each later notice too -- and its masthead follows
+    # again. The rule is data-driven: whatever the first label of the document
+    # is, its next occurrence restarts the masthead.
+    first_label: str | None = None
+
     for page in pages:
         if not page.indexable:
             continue
@@ -3418,12 +3864,18 @@ def split_blocks(
             # Keeping bbox-less native text would duplicate content and
             # misclassify cell values such as "23.2100" as clause headings.
             native_parts = []
+        # A heading the printer wrapped onto a second line must be joined before
+        # the caption de-duplication below: the wrap's tail line is frequently
+        # also the caption the table extractor picked up, and dropping it as a
+        # "duplicate caption" would silently truncate the heading and leave the
+        # table attributed to the tail line instead of the real heading.
+        rich_blocks = _join_wrapped_heading_parts(list(page.rich_blocks))
         # When a page already has structured tables, the whole-page figure_page
         # block (rendered page image + VLM caption) duplicates the table
         # content and should not be emitted as a standalone block.
         table_titles: set[str] = set()
         figure_captions: set[str] = set()
-        for item in page.rich_blocks:
+        for item in rich_blocks:
             block_type = str(item.get("block_type", "")).casefold()
             if block_type == "table":
                 title = str(
@@ -3437,7 +3889,7 @@ def split_blocks(
                 if caption:
                     figure_captions.add(_table_title_key(caption))
         page_rich_blocks: list[dict[str, Any]] = []
-        for item in page.rich_blocks:
+        for item in rich_blocks:
             block_type = str(item.get("block_type", "")).casefold()
             if has_structured_table and block_type == "figure":
                 bbox = item.get("bbox")
@@ -3558,9 +4010,22 @@ def split_blocks(
                 )
             )
         page_parts = expand_regulatory_blocks(page_parts)
+        page_parts = _join_wrapped_heading_parts(page_parts)
+        page_parts = _split_inline_heading_prefixes(page_parts)
+        # A table caption may be the only place a page carries its appendix
+        # banner ("APPENDIX II ... PROPOSALS WITHDRAWN BY PROPONENT"). Emit it
+        # as the page's opening heading so the prose above the table is
+        # attributed to the appendix instead of the part that preceded it.
+        page_banner = _page_appendix_banner(page_parts)
+        if page_banner is not None:
+            page_parts.insert(0, {"block_type": "annex", "text": page_banner})
         for local_index, item in enumerate(page_parts):
             text = str(item.get("text", "")).strip()
             if not text:
+                continue
+            if _VECTOR_PAGE_FOOTER_RE.fullmatch(text):
+                # A footer that the extractor promoted to a block of its own
+                # carries no content and would publish as a one-line chunk.
                 continue
             item_block_type = str(item.get("block_type") or "").casefold()
             # A structured table's semantic text begins with its title.  It is
@@ -3568,6 +4033,33 @@ def split_blocks(
             # it would reset an active paragraph such as 33.77(E) back to the
             # bare section 33.77 immediately before metadata is assigned.
             kind = None if item_block_type == "table" else heading_kind(text)
+            if kind is None and item_block_type != "table":
+                # Shape says "LABEL:", position says whether it divides the
+                # document or merely describes it.
+                label_parts = split_label_line(text)
+                if label_parts is not None:
+                    label = label_parts[0]
+                    body = str(item.get("label_body") or "")
+                    if first_label is None:
+                        first_label = label
+                    elif label == first_label:
+                        # Another notice starts here: its masthead follows.
+                        metadata_open = True
+                    # Masthead labels carry a short value ("ACTION: Proposed
+                    # Rules"); a label whose value is a full sentence is already
+                    # the first division ("SUMMARY: This final rule amends ...").
+                    if metadata_open and item.get("label_inline") and not _is_narrative(body):
+                        pass
+                    else:
+                        if not body:
+                            # The first bare label ends the masthead.
+                            metadata_open = False
+                        kind = "chapter"
+                        item = {**item, "block_type": "chapter"}
+                elif metadata_open and _is_narrative(text):
+                    metadata_open = False
+            if kind is not None:
+                metadata_open = False
             if kind == "chapter":
                 chapter, annex = text, None
                 article_reference = None
@@ -3754,6 +4246,29 @@ def split_blocks(
                 or ("table_hint" if TABLE_TITLE_RE.match(text) else "paragraph")
             )
             table_title = str(item.get("table_title") or "").strip()
+            previous_text = (
+                str(page_parts[local_index - 1].get("text", ""))
+                if local_index > 0
+                else ""
+            )
+            if (
+                block_type.casefold() == "table"
+                and table_title
+                and (
+                    _is_fragment_table_title(table_title, previous_text)
+                    or _is_data_derived_table_title(table_title, table_value_keys)
+                )
+            ):
+                # The "title" is the wrapped tail of the paragraph above, or a
+                # truncated value from a table's own rows; it stays in the
+                # table's text but must not become the table's section.
+                table_title = ""
+            if block_type.casefold() == "table" and table_title:
+                if _title_repeats_section(table_title, section_path):
+                    # The "title" is already part of the section label above the
+                    # table (the wrapped tail of the heading it sits under), so
+                    # promoting it would only truncate that label.
+                    table_title = ""
             if block_type.casefold() == "table" and table_title:
                 # The canonical table title is stronger context than a stale
                 # numbered prose heading carried across pages.  Keeping only
@@ -4092,8 +4607,8 @@ def chunk_from_blocks(
         article_id_normalized=article_id_normalized,
         article_parent_id=article_parent_id,
         article_aliases=article_aliases,
-        keywords=extract_keywords(title, section_key, article_aliases),
-        question_aliases=build_question_aliases(article, title),
+        keywords=extract_keywords(title, section_key, article_aliases, text=text),
+        question_aliases=build_question_aliases(article, title, text=text),
         asset_ids=asset_ids,
         table_html=table_html,
         content_type=(
@@ -4151,7 +4666,52 @@ def find_unpublished_clause_blocks(
     ]
 
 
+def _table_lead_in_block(pending: list[BlockRecord]) -> BlockRecord | None:
+    """Return the trailing pending block when it captions the next table.
+
+    Only the block directly above the table can be its caption, and only when
+    it reads as a lead-in ("... are as follows:").  A substantive paragraph or
+    a heading stays where it is.
+    """
+    if not pending:
+        return None
+    candidate = pending[-1]
+    if candidate.block_type in {"table", "figure", "formula"}:
+        return None
+    return candidate if table_lead_in_line(candidate.text) is not None else None
+
+
+def _attach_caption_sections(blocks: list[BlockRecord]) -> list[BlockRecord]:
+    """Give a table's caption the table's own section.
+
+    The vector parser publishes a table under its extracted ``table_title``
+    (``section_path = [table_title]``), which is a different section key from
+    the prose heading above it.  Without this, the caption is grouped with the
+    surrounding prose and the table keeps its broader heading, so the two can
+    never meet inside one chunk.  Only a genuine caption moves, and only when
+    the clause identifier already matches, so no chunk can be relabelled with
+    the wrong clause.
+    """
+    attached = list(blocks)
+    for index in range(len(attached) - 1):
+        caption = attached[index]
+        table = attached[index + 1]
+        if table.block_type != "table":
+            continue
+        if caption.block_type in {"table", "figure", "formula"}:
+            continue
+        if list(caption.section_path) == list(table.section_path):
+            continue
+        if caption.article_id_normalized != table.article_id_normalized:
+            continue
+        if table_lead_in_line(caption.text) is None:
+            continue
+        attached[index] = replace(caption, section_path=list(table.section_path))
+    return attached
+
+
 def build_chunks(document_id: str, blocks: list[BlockRecord]) -> list[ChunkRecord]:
+    blocks = _attach_caption_sections(blocks)
     groups: list[tuple[tuple[str, ...], str | None, list[BlockRecord]]] = []
     for block in blocks:
         section_key = tuple(block.section_path)
@@ -4197,6 +4757,15 @@ def build_chunks(document_id: str, blocks: list[BlockRecord]) -> list[ChunkRecor
 
         for block in content_blocks:
             if block.block_type == "table":
+                # A table's lead-in sentence ("... are as follows:") is
+                # extracted as an ordinary paragraph and used to be published
+                # as the previous sibling chunk, so the table reached retrieval
+                # without the sentence that names its subject.  Carry the
+                # caption into the first table part instead.
+                lead_in = _table_lead_in_block(pending)
+                if lead_in is not None:
+                    pending.pop()
+                    pending_chars = max(0, pending_chars - len(lead_in.text) - 1)
                 if pending:
                     chunks.append(
                         chunk_from_blocks(
@@ -4210,7 +4779,7 @@ def build_chunks(document_id: str, blocks: list[BlockRecord]) -> list[ChunkRecor
                     )
                     pending = []
                     pending_chars = 0
-                table_parts = (
+                table_parts = list(
                     split_structured_table_block(block, body_max_chars)
                     if block.table_rows
                     else [
@@ -4218,14 +4787,28 @@ def build_chunks(document_id: str, blocks: list[BlockRecord]) -> list[ChunkRecor
                         for part in split_table_rows(block.text, body_max_chars)
                     ]
                 )
-                for part_block in table_parts:
+                if lead_in is not None and table_parts and (
+                    len(lead_in.text) + len(table_parts[0].text) > body_max_chars
+                ):
+                    # The caption must not push the first part past the chunk
+                    # budget; a table that is already at the limit keeps its
+                    # caption in its own chunk.
+                    pending = [lead_in]
+                    pending_chars = len(lead_in.text) + 1
+                    lead_in = None
+                for part_index, part_block in enumerate(table_parts):
+                    attached = (
+                        [lead_in, part_block]
+                        if lead_in is not None and part_index == 0
+                        else [part_block]
+                    )
                     chunks.append(
                         chunk_from_blocks(
                             document_id=document_id,
                             parent_chunk_id=parent_chunk_id,
                             title=title,
                             section_key=section_key,
-                            blocks=[part_block],
+                            blocks=attached,
                             ordinal=len(chunks),
                         )
                     )
@@ -4523,8 +5106,15 @@ def parse_pdf(path: Path) -> ParsedDocument:
             or low_quality_ocr
         )
         watermark_only = is_watermark_only_page(pdf_page, raw_text)
+        margin_only_corrupt = is_margin_only_corrupt_page(
+            pdf_page,
+            raw_text,
+            layout_features,
+        )
         if watermark_only:
             page_route = "watermark_excluded"
+        elif margin_only_corrupt:
+            page_route = "blank_excluded"
         elif compact_count == 0:
             page_route = "ocr_required"
         elif compact_count < TEXT_PAGE_MIN_CHARS:
@@ -4551,7 +5141,9 @@ def parse_pdf(path: Path) -> ParsedDocument:
                 table_hints=table_hints,
                 route=page_route,
                 page_type=("table" if table_hints and not text_layer_corrupted else "text"),
-                indexable=(page_route not in {"watermark_excluded"}),
+                indexable=(
+                    page_route not in {"watermark_excluded", "blank_excluded"}
+                ),
                 image_count=layout_features["image_count"],
                 image_coverage=layout_features["image_ratio"],
                 layout_features=layout_features,

@@ -312,11 +312,25 @@ class RetrievalService:
         failures: list[RetrievalFailure] = []
         subqueries = plan.subqueries[: self._settings.retrieval.max_complex_subqueries]
         cell_by_id = {cell.id: cell for cell in plan_v2.cells}
+        # 单数规则/文档的实体枚举采用两阶段检索：首个“总述”视角在请求范围
+        # 内定位目标文档，后续名称/提及视角只扫描该 document_id，避免其它 FAA
+        # 规则中高频的 ``received comments from`` 段落混入答案。
+        enumeration_document_ids = list(request.document_ids)
         for subquery in subqueries:
             started = time.perf_counter()
             try:
+                scoped_document_ids = (
+                    enumeration_document_ids
+                    if plan.query_type == "enumeration" and enumeration_document_ids
+                    else request.document_ids
+                )
                 execution = await self._execute_single(
-                    request.model_copy(update={"query": subquery.query}),
+                    request.model_copy(
+                        update={
+                            "query": subquery.query,
+                            "document_ids": scoped_document_ids,
+                        }
+                    ),
                     user_id=user_id,
                     apply_reranker=False,
                     final_limit=self._settings.retrieval.complex_candidates_per_subquery,
@@ -339,6 +353,15 @@ class RetrievalService:
                     )
                 )
                 continue
+            if (
+                plan.query_type == "enumeration"
+                and not enumeration_document_ids
+                and execution.selected_chunks
+            ):
+                # selected_chunks 已按本视角的检索得分排序；问题指向单一规则时，
+                # 第一名所属文档就是随后文档内扫描的边界。
+                enumeration_document_ids = [execution.selected_chunks[0].document_id]
+                scoped_document_ids = enumeration_document_ids
             # 单主体 multi_hop（如"同时使用5G基站与自动机巢…空域通信/机巢
             # 运维/数据归档三类要求"）的每个子查询也是全库检索：aspect 词被
             # 完整长主语稀释后，该方面的独立语义检索视角可能漏掉字面相关但
@@ -353,7 +376,7 @@ class RetrievalService:
                             request.model_copy(
                                 update={
                                     "query": semantic_query,
-                                    "document_ids": request.document_ids,
+                                    "document_ids": scoped_document_ids,
                                 }
                             ),
                             user_id=user_id,
@@ -399,7 +422,11 @@ class RetrievalService:
         selection = self._coverage_selector.select(
             plan,
             results,
-            limit=self._settings.retrieval.complex_final_limit,
+            limit=(
+                self._settings.retrieval.enumeration_final_limit
+                if plan.query_type == "enumeration"
+                else self._settings.retrieval.complex_final_limit
+            ),
             missing_subjects=missing_subjects,
         )
         selected, citations = self._citation_service.build(selection.chunks)
@@ -453,6 +480,11 @@ class RetrievalService:
                 "coverage_cells": len(selection.matrix),
                 "covered_cells": sum(
                     cell.status == "covered" for cell in selection.matrix
+                ),
+                **(
+                    {"enumeration_document_locked": 1}
+                    if plan.query_type == "enumeration" and enumeration_document_ids
+                    else {}
                 ),
                 **({"subquery_failures": len(failures)} if failures else {}),
             },
@@ -1773,7 +1805,11 @@ class RetrievalService:
             return False
         subqueries = {item.id: item for item in plan.subqueries}
         reranked_any = False
-        remaining_budget = self._settings.retrieval.complex_rerank_input_k
+        remaining_budget = (
+            self._settings.retrieval.enumeration_rerank_input_k
+            if plan.query_type == "enumeration"
+            else self._settings.retrieval.complex_rerank_input_k
+        )
         for subquery_id, candidates in results.items():
             subquery = subqueries.get(subquery_id)
             if subquery is None or not candidates or remaining_budget <= 0:

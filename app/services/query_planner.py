@@ -142,7 +142,42 @@ class QueryPlanner:
                 expansion_mode="document",
                 synthesis_mode="map_reduce",
             )
+        if query.query_type == "enumeration":
+            return self._enumeration_plan(query)
         return self._single_plan(query)
+
+    @staticmethod
+    def _enumeration_plan(query: NormalizedQuery) -> QueryPlan:
+        """为跨段落实体清单提供互补的语义与字面检索视角。
+
+        英文触发词有意独立成子查询：适航资料的中文问法与英文原文之间存在
+        词汇鸿沟，而机构名称通常只出现在 ``received comments from``、
+        ``stated`` 等处理意见段落中。
+        """
+        text = query.normalized_query
+        subqueries = [
+            SubQuery(id="q1", query=text, aspect="实体类型与总述"),
+            SubQuery(
+                id="q2",
+                query=f"{text} 具体名称 完整名单 机构 单位 组织",
+                aspect="具体实体名称",
+            ),
+            SubQuery(
+                id="q3",
+                query=(
+                    f"{text} received comments from commenter commented stated "
+                    "requested recommended suggested objected"
+                ),
+                aspect="分散在讨论段落中的实体",
+            ),
+        ]
+        return QueryPlan(
+            query_type="enumeration",
+            aspects=[item.aspect for item in subqueries],
+            subqueries=subqueries,
+            expansion_mode="document",
+            synthesis_mode="map_reduce",
+        )
 
     def _comparison_plan(self, query: NormalizedQuery) -> QueryPlan | None:
         text = query.normalized_query

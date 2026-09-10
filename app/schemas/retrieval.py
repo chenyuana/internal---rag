@@ -10,6 +10,7 @@ QueryType: TypeAlias = Literal[
     "comparison",
     "multi_hop",
     "procedure",
+    "enumeration",
     "unknown",
 ]
 

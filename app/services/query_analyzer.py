@@ -43,6 +43,15 @@ _INVENTORY_REASONS = (
     "用户要求枚举文件/文档清单",
 )
 
+# 实体枚举题与“知识库文件/版本清单”不同：答案通常散落在同一文档的多个
+# 讨论段落中，必须拆成多个检索视角后聚合，不能按普通 fact 的 Top-N 截断。
+# 对象词用于保持规则保守，避免把“系统有哪些功能”之类问题扩大为文档扫描。
+_ENTITY_ENUMERATION = re.compile(
+    r"(?:哪些|哪几类|所有|全部|完整|具体|逐一|分别).{0,12}"
+    r"(?:机构|单位|组织|评论者|评论方|参与方|参与者|厂商|制造商|主管机构|协会|型号|标准)"
+    r"|(?:列举|列出|枚举).{0,12}(?:机构|单位|组织|评论者|评论方|参与方|厂商|制造商|协会|名称)"
+)
+
 class QueryAnalyzer:
     """Perform deterministic normalization without damaging technical symbols."""
 
@@ -116,6 +125,8 @@ class QueryAnalyzer:
             return "multi_hop"
         if _CROSS_DOC_PATTERN.search(query):
             return "multi_hop"
+        if _ENTITY_ENUMERATION.search(query):
+            return "enumeration"
         if lowered.endswith("?") or query.endswith("？"):
             return "fact"
         return "unknown"

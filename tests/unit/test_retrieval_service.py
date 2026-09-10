@@ -93,6 +93,38 @@ class FailingSubqueryRagflow:
         return []
 
 
+class EnumerationScopeRagflow:
+    def __init__(self) -> None:
+        self.requests: list[RagflowRetrievalRequest] = []
+
+    async def retrieve(
+        self,
+        request: RagflowRetrievalRequest,
+    ) -> list[RetrievedChunk]:
+        self.requests.append(request)
+        if not request.document_ids:
+            return [
+                chunk(
+                    "overview",
+                    text="The FAA received comments from manufacturers and authorities.",
+                    score=0.95,
+                    document_name="FAA-23-62.pdf",
+                    document_id="doc-23-62",
+                )
+            ]
+        if request.document_ids == ["doc-23-62"]:
+            return [
+                chunk(
+                    "commenters",
+                    text="The FAA received comments from Transport Canada and EASA.",
+                    score=0.9,
+                    document_name="FAA-23-62.pdf",
+                    document_id="doc-23-62",
+                )
+            ]
+        return []
+
+
 class FakeReranker:
     async def rerank(
         self,
@@ -219,6 +251,35 @@ async def test_pipeline_filters_before_rerank_and_assigns_citations(
     reasons = {item.chunk_id: item.filter_reason for item in debug.candidates}
     assert reasons["old"] == "inactive_document"
     assert reasons["foreign"] == "unauthorized_dataset"
+
+
+async def test_enumeration_locks_followup_queries_to_first_document(
+    settings: Settings,
+) -> None:
+    fake_ragflow = EnumerationScopeRagflow()
+    service = RetrievalService(
+        settings=settings,
+        ragflow=cast(RagflowClient, cast(Any, fake_ragflow)),
+        reranker=None,
+        access_control=AccessControlService(settings.access_control),
+    )
+
+    execution = await service.execute(
+        RetrievalSearchRequest(
+            query="FAA 23-62规则的主要评论方有哪些类型？请列举具体机构。",
+            knowledge_base_ids=["kb-1"],
+        ),
+        user_id="user-1",
+    )
+
+    assert execution.query.query_type == "enumeration"
+    assert fake_ragflow.requests[0].document_ids == []
+    assert all(
+        request.document_ids == ["doc-23-62"]
+        for request in fake_ragflow.requests[1:]
+    )
+    assert execution.stage_counts["enumeration_document_locked"] == 1
+    assert {item.document_id for item in execution.selected_chunks} == {"doc-23-62"}
 
 
 async def test_simple_retrieval_rejects_candidates_below_rerank_floor(

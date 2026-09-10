@@ -7,7 +7,7 @@ import logging
 import re
 import shutil
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,7 +33,11 @@ from app.ingestion.parsers.native_pdf import NativePdfParser
 from app.ingestion.parsers.remote import DoclingClient, MinerUClient
 from app.ingestion.parsers.scan_regulatory import ScannedRegulatoryPdfParser
 from app.ingestion.pipeline import write_document
-from app.ingestion.publishers import RagflowPlan, RagflowPublisher
+from app.ingestion.publishers import (
+    RagflowPlan,
+    RagflowPublisher,
+    chunk_publish_facets,
+)
 from app.schemas.ingestion import (
     IngestionChunkUpdateResult,
     IngestionJob,
@@ -875,6 +879,30 @@ class IngestionJobService:
                 ) from exc
         self._locks.pop(job_id, None)
 
+    def _publish_views(
+        self,
+        source_name: str,
+        chunks: Iterable[Any],
+    ) -> list[dict[str, Any]]:
+        """Attach the exact fragments RAGFlow will receive to each chunk.
+
+        The workbench renders these instead of re-deriving the prefix, so the
+        "查看发送到 RAGFlow 的实际内容" panel cannot drift from the upload.
+        """
+        views: list[dict[str, Any]] = []
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            facets = chunk_publish_facets(source_name, chunk)
+            views.append(
+                {
+                    **chunk,
+                    "ragflow_content": facets.content,
+                    "ragflow_important_keywords": facets.important_keywords,
+                }
+            )
+        return views
+
     def preview(self, job_id: str, *, chunk_limit: int | None = None) -> IngestionPreview:
         job = self._read_job(job_id)
         if not job.output_path:
@@ -930,7 +958,7 @@ class IngestionJobService:
             quality=payload.get("qa", {}),
             page_routes=dict(page_routes),
             pages=page_summaries,
-            chunks=payload.get("chunks", [])[:limit],
+            chunks=self._publish_views(job.source_name, payload.get("chunks", [])[:limit]),
         )
 
     def page_detail(self, job_id: str, page_number: int) -> IngestionPageDetail:
@@ -1024,7 +1052,7 @@ class IngestionJobService:
             page_number=page_number,
             page=detail_page,
             blocks=blocks,
-            chunks=chunks,
+            chunks=self._publish_views(job.source_name, chunks),
             assets=assets,
             parser_trace=trace,
             quality_gates=gates,

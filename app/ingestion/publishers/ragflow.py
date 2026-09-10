@@ -4,7 +4,7 @@ import base64
 import hashlib
 import json
 import mimetypes
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +13,11 @@ import httpx
 
 from app.core.config import RagflowSettings
 from app.core.exceptions import AppError
+from app.ingestion.regulations import (
+    build_question_aliases,
+    extract_keywords,
+    match_article_heading,
+)
 
 SOURCE_MEDIA_TYPES = {
     ".pdf": "application/pdf",
@@ -33,6 +38,103 @@ class RagflowPlan:
     source_sha256: str
     chunks: tuple[RagflowChunkPlan, ...]
     plan_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class PublishFacets:
+    """The searchable fragments of one chunk exactly as RAGFlow receives them."""
+
+    content: str
+    important_keywords: list[str]
+    questions: list[str]
+
+
+def chunk_publish_facets(
+    source_name: str,
+    raw_chunk: Mapping[str, Any],
+) -> PublishFacets:
+    """Render ``content`` / ``important_keywords`` / ``questions`` for one chunk.
+
+    This is the single source of truth for what leaves the gateway: the
+    publisher uploads these fragments and the workbench shows these same
+    fragments, so an operator reviewing "查看发送到 RAGFlow 的实际内容" can never
+    be shown something different from the upload.
+    """
+    text = str(raw_chunk.get("text", "")).strip()
+    section_path = [
+        str(value).strip()
+        for value in raw_chunk.get("section_path", [])
+        if str(value).strip()
+    ]
+    title = str(raw_chunk.get("title", "")).strip()
+    article_id = str(raw_chunk.get("article_id_normalized") or "").strip()
+    article_aliases = [
+        str(value).strip()
+        for value in raw_chunk.get("article_aliases", [])
+        if str(value).strip()
+    ]
+    chunk_keywords = extract_keywords(
+        title,
+        section_path,
+        article_aliases,
+        text=text,
+        table_rows=raw_chunk.get("table_rows"),
+    )
+    stored_questions = [
+        str(value).strip()
+        for value in raw_chunk.get("question_aliases", [])
+        if str(value).strip()
+    ]
+    questions = stored_questions or build_question_aliases(
+        match_article_heading(title),
+        title,
+        text=text,
+    )
+    table_ids = [
+        str(value).strip()
+        for value in raw_chunk.get("table_ids", [])
+        if str(value).strip()
+    ]
+    # Raw LaTeX is NOT put into tag_kwd: every formula would be a unique
+    # high-cardinality tag and the backslashes/braces risk breaking tag
+    # parsing. Instead it is appended to the content under a marked section.
+    formula_latex = [
+        str(value).strip()
+        for value in raw_chunk.get("formula_latex", [])
+        if str(value).strip() and str(value).strip().casefold() != "none"
+    ]
+
+    prefix_parts = [f"文档：{source_name}"]
+    if section_path:
+        prefix_parts.append("章节：" + " / ".join(section_path))
+    if article_id:
+        prefix_parts.append(f"条号：{article_id}")
+    page_start = int(raw_chunk.get("page_start", 0))
+    page_end = int(raw_chunk.get("page_end", page_start))
+    if page_start > 0:
+        page_label = (
+            str(page_start) if page_end in (0, page_start) else f"{page_start}-{page_end}"
+        )
+        prefix_parts.append(f"页码：{page_label}")
+    # Controlled glossary/structure anchors let Chinese questions rank an
+    # English source chunk. They are explicitly marked as metadata, never a
+    # replacement for the source evidence below.
+    if chunk_keywords:
+        prefix_parts.append("检索锚点（非规范译文）：" + "；".join(chunk_keywords))
+    content = "\n".join(prefix_parts) + "\n\n" + text
+    if formula_latex:
+        content += "\n\n[原始公式]\n" + "\n".join(formula_latex)
+    return PublishFacets(
+        content=content,
+        important_keywords=[
+            item
+            for item in dict.fromkeys(
+                [article_id, *article_aliases, *chunk_keywords, *table_ids]
+            )
+            if item
+        ],
+        questions=list(dict.fromkeys(questions)),
+    )
 
 
 class RagflowPublisher:
@@ -100,28 +202,12 @@ class RagflowPublisher:
             chunk_id = str(raw_chunk.get("chunk_id", "")).strip()
             if not text or not chunk_id:
                 continue
-            section_path = [
-                str(value).strip()
-                for value in raw_chunk.get("section_path", [])
-                if str(value).strip()
-            ]
-            title = str(raw_chunk.get("title", "")).strip()
             article_id = str(raw_chunk.get("article_id_normalized") or "").strip()
-            article_aliases = [
-                str(value).strip()
-                for value in raw_chunk.get("article_aliases", [])
-                if str(value).strip()
-            ]
-            chunk_keywords = [
-                str(value).strip()
-                for value in raw_chunk.get("keywords", [])
-                if str(value).strip()
-            ]
-            questions = [
-                str(value).strip()
-                for value in raw_chunk.get("question_aliases", [])
-                if str(value).strip()
-            ]
+            # Rebuild retrieval metadata at publication time (``chunk_publish_facets``).
+            # This upgrades previously parsed IR too: old documents may contain a
+            # repeated section heading split into generic important keywords, and
+            # operator-authored question aliases in an existing IR are preserved.
+            facets = chunk_publish_facets(source_name, raw_chunk)
             page_start = int(raw_chunk.get("page_start", 0))
             page_end = int(raw_chunk.get("page_end", page_start))
             table_html = [
@@ -134,36 +220,15 @@ class RagflowPublisher:
                 for value in raw_chunk.get("table_ids", [])
                 if str(value).strip()
             ]
-            prefix_parts = [f"文档：{source_name}"]
-            if section_path:
-                prefix_parts.append("章节：" + " / ".join(section_path))
-            if article_id:
-                prefix_parts.append(f"条号：{article_id}")
-            if page_start > 0:
-                page_label = (
-                    str(page_start)
-                    if page_end in (0, page_start)
-                    else f"{page_start}-{page_end}"
-                )
-                prefix_parts.append(f"页码：{page_label}")
-            content = "\n".join(prefix_parts) + "\n\n" + text
             # Table chunks already carry retrieval-oriented field/value text.
             # Re-appending the full HTML duplicates every cell, inflates the
             # embedding input, and can make malformed OCR geometry look more
             # trustworthy than it is. The lossless HTML stays in document_ir;
             # RAGFlow receives the semantic text plus table/image metadata.
-            keywords = list(
-                dict.fromkeys(
-                    [
-                        title,
-                        *section_path,
-                        article_id,
-                        *article_aliases,
-                        *chunk_keywords,
-                        *table_ids,
-                    ]
-                )
-            )
+            # Title and section path already exist in ``content``. Promoting
+            # them to important keywords on every child chunk makes a repeated
+            # appendix heading dominate chunk-specific terms and causes a
+            # stable-but-wrong document-order ranking.
             tags = [
                 f"source_sha256:{source_sha256}",
                 f"internal_chunk_id:{chunk_id}",
@@ -181,22 +246,15 @@ class RagflowPublisher:
             for related in raw_chunk.get("related_chunks", []):
                 if isinstance(related, dict) and related.get("chunk_id"):
                     tags.append(f"related_chunk_id:{related['chunk_id']}")
-            # Raw LaTeX is NOT put into tag_kwd: every formula would be a
-            # unique high-cardinality tag and the backslashes/braces risk
-            # breaking tag parsing. Instead emit finite enum tags here and
-            # keep the LaTeX in a dedicated [原始公式] section of content.
-            formula_latex = [
-                str(value).strip()
-                for value in raw_chunk.get("formula_latex", [])
-                if str(value).strip() and str(value).strip().casefold() != "none"
-            ]
-            if formula_latex:
+            # Raw LaTeX is NOT put into tag_kwd: every formula would be a unique
+            # high-cardinality tag and the backslashes/braces risk breaking tag
+            # parsing. ``chunk_publish_facets`` keeps it in the content instead.
+            if "[原始公式]" in facets.content:
                 tags.append("has_formula")
-                content += "\n\n[原始公式]\n" + "\n".join(formula_latex)
             payload = {
-                "content": content,
-                "important_keywords": [item for item in keywords if item],
-                "questions": list(dict.fromkeys(questions)),
+                "content": facets.content,
+                "important_keywords": facets.important_keywords,
+                "questions": facets.questions,
                 "tag_kwd": tags,
                 "chunk_order": len(planned),
                 "page_numbers": (

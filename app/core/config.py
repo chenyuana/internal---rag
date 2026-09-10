@@ -203,6 +203,10 @@ class RetrievalSettings(BaseModel):
     # 对比/多跳矩阵的最终证据名额（对比矩阵每格需要 1~3 个 chunk 承载
     # 各维度章节，如桥梁设备选型需同时含 4.3.2 无人机与 4.3.4 云台相机）。
     complex_final_limit: int = Field(default=12, ge=4, le=24)
+    # 实体枚举题的答案常跨越同一文档的许多讨论段落，需给每个检索视角
+    # 足够的重排输入，并允许更多去重后的章节进入生成。
+    enumeration_rerank_input_k: int = Field(default=36, ge=3, le=100)
+    enumeration_final_limit: int = Field(default=20, ge=4, le=40)
     complex_similarity_threshold: float = Field(default=0.15, ge=0, le=1)
     min_rerank_score: float = Field(default=0.1, ge=0, le=1)
     complex_min_rerank_score: float = Field(default=0.1, ge=0, le=1)
@@ -232,6 +236,7 @@ class GenerationSettings(BaseModel):
     enforce_comparison_completeness: bool = True
     json_repair_attempts: int = Field(default=1, ge=0, le=2)
     max_evidence_sentences: int = Field(default=16, ge=1, le=100)
+    enumeration_max_evidence_sentences: int = Field(default=30, ge=1, le=100)
     max_sentences_per_citation: int = Field(default=5, ge=1, le=10)
     min_evidence_overlap: float = Field(default=0.08, ge=0, le=1)
     answer_prompt_path: str = "prompts/answer_generation.txt"

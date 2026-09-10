@@ -22,6 +22,7 @@ const state = {
   savingChunk: false,
   exportingJobId: null,
   savingLlmStructureSettings: false,
+  pageReprocessing: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -703,6 +704,7 @@ function renderQuality(job, preview) {
             </header>
             <p>${escapeHtml(chunk.text)}</p>
             ${structuredTableMarkup(chunk.table_html)}
+            <small>关键词：${escapeHtml(publishedKeywords(chunk).join("、") || "无")}</small>
             <details>
               <summary>查看发送到 RAGFlow 的实际内容</summary>
               <pre>${escapeHtml(ragflowContentPreview(preview?.source_name, chunk))}</pre>
@@ -836,7 +838,23 @@ function structuredTableMarkup(value) {
     : "";
 }
 
+function publishedKeywords(chunk) {
+  // RAGFlow's keyword field is article id + aliases + anchors + table ids, not
+  // the IR keyword list; show the published list when the backend sent it.
+  if (Array.isArray(chunk.ragflow_important_keywords) && chunk.ragflow_important_keywords.length) {
+    return chunk.ragflow_important_keywords;
+  }
+  return chunk.keywords || [];
+}
+
 function ragflowContentPreview(sourceName, chunk) {
+  // The backend renders the payload fragments (including the 检索锚点 line) with
+  // the same code the publisher uploads. Prefer it so this panel cannot show
+  // something different from what RAGFlow receives. The fallback below only
+  // covers responses produced before that field existed.
+  if (typeof chunk.ragflow_content === "string" && chunk.ragflow_content) {
+    return chunk.ragflow_content;
+  }
   const prefix = [`文档：${sourceName || ""}`];
   if (chunk.section_path?.length) {
     prefix.push(`章节：${chunk.section_path.join(" / ")}`);
@@ -892,7 +910,7 @@ function renderPageChunks(detail) {
           </header>
           <p>${escapeHtml(chunk.text || "")}</p>
           ${structuredTableMarkup(chunk.table_html)}
-          <small>关键词：${escapeHtml((chunk.keywords || []).join("、") || "无")}</small>
+          <small>关键词：${escapeHtml(publishedKeywords(chunk).join("、") || "无")}</small>
           <details>
             <summary>查看发送到 RAGFlow 的实际内容</summary>
             <pre>${escapeHtml(ragflowContentPreview(detail.source_name, chunk))}</pre>
@@ -967,6 +985,7 @@ async function openPageDetail(pageNumber) {
   const dialog = $("pageDialog");
   $("pageDialogTitle").textContent = `第 ${pageNumber} 页`;
   $("pageDialogMeta").textContent = "正在加载解析结果…";
+  renderPageReprocessControls(null);
   const sourceUrl =
     `${API}/jobs/${state.selectedJobId}/source#page=${pageNumber}&zoom=page-width`;
   const sourceFrame = $("pageSourceFrame");
@@ -991,6 +1010,7 @@ async function openPageDetail(pageNumber) {
     );
     state.currentPageNumber = pageNumber;
     state.currentPageDetail = detail;
+    renderPageReprocessControls(detail);
     const page = detail.page || {};
     const articles = page.article_ids || [];
     $("pageDialogMeta").textContent =
@@ -1080,6 +1100,79 @@ async function openPageDetail(pageNumber) {
   } catch (error) {
     $("pageDialogMeta").textContent = error.message;
     $("pageCleanedText").textContent = "页面诊断加载失败。";
+    renderPageReprocessControls(null, error.message);
+  }
+}
+
+function renderPageReprocessControls(detail, loadError = "") {
+  const supported = Boolean(detail?.page_reprocess?.supported);
+  const busy = state.pageReprocessing;
+  $("recleanPageButton").disabled = busy || !supported;
+  $("reocrPageButton").disabled = busy || !supported;
+  if (busy) {
+    setMessage($("pageActionHint"), "正在提交单页处理任务，请稍候…");
+    return;
+  }
+  if (loadError) {
+    setMessage($("pageActionHint"), `无法加载单页处理状态：${loadError}`, true);
+    return;
+  }
+  if (detail && !supported) {
+    setMessage(
+      $("pageActionHint"),
+      detail.page_reprocess?.reason || "当前页面暂不支持单页处理。",
+      true,
+    );
+    return;
+  }
+  setMessage(
+    $("pageActionHint"),
+    "重新清洗只复用缓存；重新 OCR 仅发送当前页。两种方式都会重建相关 Chunk。",
+  );
+}
+
+async function reprocessCurrentPage(mode) {
+  if (
+    state.pageReprocessing ||
+    !state.selectedJobId ||
+    !state.currentPageNumber ||
+    !state.currentPageDetail?.page_reprocess?.supported
+  ) {
+    return;
+  }
+  const label = mode === "ocr" ? "重新 OCR" : "使用缓存重新清洗";
+  const confirmed = window.confirm(
+    `${label}第 ${state.currentPageNumber} 页并重建相关 Chunk？\n\n` +
+      "处理成功后将生成新版本，并重置当前审核和发布计划；失败时保留旧结果。",
+  );
+  if (!confirmed) return;
+
+  state.pageReprocessing = true;
+  renderPageReprocessControls(state.currentPageDetail);
+  const pageNumber = state.currentPageNumber;
+  try {
+    await requestJson(
+      `${API}/jobs/${state.selectedJobId}/pages/${pageNumber}/reprocess`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-User-ID": "local-operator",
+        },
+        body: JSON.stringify({ mode }),
+      },
+    );
+    $("pageDialog").close();
+    setMessage(
+      $("detailMessage"),
+      `第 ${pageNumber} 页已进入${label}队列；其他页面复用现有结果。`,
+    );
+    await refreshAll();
+  } catch (error) {
+    setMessage($("pageActionHint"), error.message, true);
+  } finally {
+    state.pageReprocessing = false;
+    if ($("pageDialog").open) renderPageReprocessControls(state.currentPageDetail);
   }
 }
 
@@ -1669,6 +1762,8 @@ function initializeEvents() {
     updateReviewStatus("approved", false, true),
   );
   $("pageDialogClose").addEventListener("click", () => $("pageDialog").close());
+  $("recleanPageButton").addEventListener("click", () => reprocessCurrentPage("clean"));
+  $("reocrPageButton").addEventListener("click", () => reprocessCurrentPage("ocr"));
   $("pageDialog").addEventListener("close", () => {
     state.currentPageNumber = null;
     state.currentPageDetail = null;

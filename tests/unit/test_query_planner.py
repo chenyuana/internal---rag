@@ -281,3 +281,19 @@ def test_comparison_single_dimension_tongchou_qufen_tail_stripped() -> None:
 
     assert plan is not None
     assert plan.aspects == ["设备选型"]
+
+
+def test_commenter_enumeration_uses_document_scan_queries() -> None:
+    query = QueryAnalyzer().analyze(
+        "FAA 23-62规则的主要评论方有哪些类型？请列举具体机构。"
+    )
+
+    plan = QueryPlanner().plan(query)
+
+    assert plan.query_type == "enumeration"
+    assert plan.expansion_mode == "document"
+    assert plan.synthesis_mode == "map_reduce"
+    assert len(plan.subqueries) == 3
+    assert [item.id for item in plan.subqueries] == ["q1", "q2", "q3"]
+    assert "received comments from" in plan.subqueries[2].query
+    assert "objected" in plan.subqueries[2].query

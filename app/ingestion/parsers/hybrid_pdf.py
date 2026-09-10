@@ -10,6 +10,7 @@ import tempfile
 import unicodedata
 from collections.abc import Callable
 from dataclasses import fields
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ContentStream
 
 from app.ingestion.parsers.figure_vision import FigureVisionClient
+from app.ingestion.parsers.formula_recovery import crop_formula_source
 from app.ingestion.parsers.native_pdf import NativePdfParser
 from app.ingestion.parsers.remote import (
     DoclingClient,
@@ -49,6 +51,7 @@ from app.ingestion.pipeline import (
     repair_invalid_unicode,
     split_blocks,
     split_merged_or_rows,
+    stable_id,
     table_rows_from_html,
     table_to_html,
     table_to_semantic_text,
@@ -73,6 +76,51 @@ REPEATED_IMAGE_WATERMARK_MIN_PAGE_FRACTION = 0.5
 # digits. Only the multiset of words and numbers matters, so a crop that fuses
 # or splits cells still passes while one that duplicates/loses a value fails.
 _TABLE_TOKEN_RE = re.compile(r"[a-z]+|\d+(?:\.\d+)?%?")
+_FORMULA_CONTEXT_SYMBOL_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]{0,12})\s*=")
+
+
+def _formula_context_symbols(items: list[dict[str, Any]], start: int) -> set[str]:
+    """Return nearby variables explicitly defined for a display formula.
+
+    Formula OCR should not be accepted merely because a crop looks more
+    mathematical.  Regulatory and technical documents commonly define each
+    symbol immediately after ``where--``; those definitions give us a local,
+    document-independent consistency check.
+    """
+
+    context: list[str] = []
+    for item in items[start + 1 : start + 15]:
+        if item.get("block_type") == "heading":
+            break
+        text = str(item.get("text") or "")
+        if text:
+            context.append(text)
+        if sum(map(len, context)) >= 1_200:
+            break
+    symbols = set()
+    for symbol in _FORMULA_CONTEXT_SYMBOL_RE.findall(" ".join(context)):
+        compact = re.sub(r"[^a-z0-9]", "", symbol.casefold())
+        if len(compact) >= 2:
+            symbols.add(compact)
+    return symbols
+
+
+def _formula_context_score(latex: str, symbols: set[str]) -> tuple[int, int]:
+    """Score a LaTeX candidate against its locally declared symbols.
+
+    The first value is a conservative evidence score; the second is the
+    number of matching symbols, used to keep score weights explainable in
+    review metadata.  Formatting-only changes never win this comparison.
+    """
+
+    normalized = unicodedata.normalize("NFKD", latex).encode("ascii", "ignore").decode()
+    normalized = re.sub(r"\\(?:mathsf|mathrm|mathcal|tilde|it|operatorname)\b", "", normalized)
+    normalized = re.sub(r"[^a-z0-9]", "", normalized.casefold())
+    matches = sum(symbol in normalized for symbol in symbols)
+    structure = 2 * (r"\frac" in latex) + (r"^" in latex) + (r"_" in latex)
+    # Long prose inside an equation item is a common remote-OCR failure mode.
+    prose = len(re.findall(r"\\(?:mathrm|mathsf)\s*\{[^{}]{12,}\}", latex))
+    return matches * 10 + structure - prose, matches
 
 
 def _table_token_multiset(rows: list[list[str]]) -> dict[str, int]:
@@ -875,6 +923,12 @@ class HybridPdfParser:
             for page in document.pages
             if page.text_layer_corruption.get("glyph_name_garbage")
         ]
+        margin_only_glyph_pages = sorted(
+            set(text_layer_corrupted_pages) & set(blank_pages)
+        )
+        ocr_glyph_pages = sorted(
+            set(text_layer_corrupted_pages) - set(margin_only_glyph_pages)
+        )
         if not content_pages or not chunks:
             gates.append(
                 {
@@ -1047,14 +1101,23 @@ class HybridPdfParser:
                 }
             )
         if text_layer_corrupted_pages:
+            recovery_note = (
+                f"OCR recovery requested for pages: {ocr_glyph_pages}."
+                if ocr_glyph_pages
+                else "No indexable body text required OCR recovery."
+            )
+            if margin_only_glyph_pages:
+                recovery_note += (
+                    " Header/footer-only blank pages were excluded: "
+                    f"{margin_only_glyph_pages}."
+                )
             gates.append(
                 {
                     "status": "warn",
                     "gate": "text_layer_glyph_names",
                     "message": (
                         "Native PDF text exposed PostScript glyph names instead of real "
-                        f"text; affected pages were routed through OCR: "
-                        f"{text_layer_corrupted_pages}"
+                        f"text; {recovery_note}"
                     ),
                 }
             )
@@ -1254,6 +1317,157 @@ class HybridPdfParser:
                     recovered += 1
                     break
         return recovered, warnings
+
+    def _recover_suspect_formula_crops(
+        self,
+        document: ParsedDocument,
+        path: Path,
+        page_numbers: set[int],
+    ) -> tuple[int, int, list[str]]:
+        """Re-OCR only formula crops whose symbols conflict with local context.
+
+        Whole-page OCR is intentionally kept as the default: it supplies the
+        reading order and surrounding definitions.  A high-resolution crop is
+        attempted only where those definitions expose a likely formula error.
+        A crop replaces the original LaTeX only when it matches *more* locally
+        declared symbols, preventing a prettier but invented formula from
+        overwriting the original result.
+        """
+
+        recovered = 0
+        crops = 0
+        warnings: list[str] = []
+        if not page_numbers or not self.mineru.enabled:
+            return recovered, crops, warnings
+
+        existing_assets = {asset.asset_id for asset in document.assets}
+        for page_number in sorted(page_numbers):
+            page = document.pages[page_number - 1]
+            pending: list[tuple[dict[str, Any], str, set[str], int, int, Any]] = []
+            for index, item in enumerate(page.rich_blocks):
+                if str(item.get("block_type") or "").casefold() != "formula":
+                    continue
+                latex = str(item.get("latex") or "").strip()
+                bbox = item.get("bbox")
+                if not latex or not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+                    continue
+                symbols = _formula_context_symbols(page.rich_blocks, index)
+                if len(symbols) < 2:
+                    continue
+                baseline_score, baseline_matches = _formula_context_score(latex, symbols)
+                # Avoid adding latency to sound formulas.  The crop path is for
+                # an incomplete local-symbol match or visibly malformed math.
+                if baseline_matches / len(symbols) >= 0.8 and r"\tilde" not in latex:
+                    continue
+                # Definitions such as ``C_3 = 0.0016`` and ``P = pressure``
+                # have no baseline geometry to recover.  Crop only expressions
+                # whose fraction/root structure or malformed glyphs warrants
+                # the extra OCR work.
+                if not any(token in latex for token in (r"\frac", r"\sqrt", r"\tilde")):
+                    continue
+                try:
+                    crop = crop_formula_source(path, page_number, list(bbox[:4]))
+                except (OSError, ValueError, RuntimeError) as exc:
+                    warnings.append(
+                        f"Formula crop render failed on page {page_number}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+
+                asset_id = stable_id(
+                    "source-formula-crop-v2",
+                    document.source_hash,
+                    page_number,
+                    *(round(value, 1) for value in crop.bbox),
+                )
+                if asset_id not in existing_assets:
+                    document.assets.append(
+                        AssetRecord(
+                            asset_id=asset_id,
+                            page_number=page_number,
+                            asset_type="formula",
+                            bbox=crop.bbox,
+                            filename=f"{asset_id}.png",
+                            mime_type="image/png",
+                            content=crop.png,
+                            caption=latex,
+                            description=(
+                                "High-resolution source-PDF formula crop for "
+                                "OCR verification."
+                            ),
+                        )
+                    )
+                    existing_assets.add(asset_id)
+                previous_assets = [
+                    value for value in item.get("asset_ids", []) if value != asset_id
+                ]
+                item["asset_id"] = asset_id
+                item["asset_ids"] = [asset_id, *previous_assets]
+                crops += 1
+                pending.append(
+                    (item, latex, symbols, baseline_score, baseline_matches, crop)
+                )
+
+            if not pending:
+                continue
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix="internal-rag-formula-crop-"
+                ) as temporary_directory:
+                    crop_path = Path(temporary_directory) / "formula-crops.pdf"
+                    writer = PdfWriter()
+                    for *_metadata, crop in pending:
+                        reader = PdfReader(BytesIO(crop.ocr_pdf))
+                        writer.add_page(reader.pages[0])
+                    with crop_path.open("wb") as stream:
+                        writer.write(stream)
+                    result = self.mineru.parse_pages(
+                        crop_path,
+                        list(range(1, len(pending) + 1)),
+                        parse_method="ocr",
+                    )
+            except Exception as exc:
+                warnings.append(
+                    f"Formula crop OCR failed on page {page_number}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+
+            for crop_page, pending_item in enumerate(pending, start=1):
+                (
+                    item,
+                    _latex,
+                    symbols,
+                    baseline_score,
+                    baseline_matches,
+                    _crop,
+                ) = pending_item
+                candidates = [
+                    block
+                    for block in result.page_blocks.get(crop_page, [])
+                    if block.block_type == "formula" and block.latex
+                ]
+                if not candidates:
+                    continue
+                candidate = max(
+                    candidates,
+                    key=lambda block: _formula_context_score(str(block.latex), symbols)[0],
+                )
+                candidate_latex = str(candidate.latex).strip()
+                candidate_score, candidate_matches = _formula_context_score(
+                    candidate_latex, symbols
+                )
+                if candidate_score <= baseline_score or candidate_matches <= baseline_matches:
+                    continue
+                item["latex"] = candidate_latex
+                item["text"] = candidate.text
+                item["formula_crop_recovery"] = {
+                    "method": "source_high_resolution_crop",
+                    "baseline_context_matches": baseline_matches,
+                    "candidate_context_matches": candidate_matches,
+                }
+                recovered += 1
+        return recovered, crops, warnings
 
     @staticmethod
     def _table_page_score(result: RemoteParseResult, page_number: int) -> tuple[int, int, int]:
@@ -1546,6 +1760,24 @@ class HybridPdfParser:
         target_has_formula = any(
             item.get("block_type") == "formula" for item in target.rich_blocks
         )
+        if target_has_formula:
+            formula_recovered, formula_crops, formula_crop_warnings = (
+                self._recover_suspect_formula_crops(
+                    document,
+                    path,
+                    {page_number},
+                )
+            )
+            warnings.extend(formula_crop_warnings)
+            trace.append(
+                {
+                    "parser": "formula-crop-ocr",
+                    "status": "completed" if formula_crops else "noop",
+                    "target_pages": [page_number],
+                    "source_crops": formula_crops,
+                    "recovered_formulas": formula_recovered,
+                }
+            )
         trace.append(
             {
                 "parser": self.mineru.name,
@@ -1716,7 +1948,15 @@ class HybridPdfParser:
         preserved_figures: set[int] = set()
         scanned_text_pages: set[int] = set()
         figure_review_pages: set[int] = set()
-        blank_pages: set[int] = set()
+        # Native preflight can already prove that a corrupt glyph stream belongs
+        # only to header/footer text on an otherwise blank page. Seed the blank
+        # set so those pages are neither sent to OCR nor reported as unresolved
+        # when the OCR service quite reasonably returns no body.
+        blank_pages: set[int] = {
+            page.page_number
+            for page in document.pages
+            if page.route == "blank_excluded"
+        }
         described_figure_pages: set[int] = set()
 
         # Font outlines look like drawings to the vector parser. Keep these
@@ -1900,6 +2140,38 @@ class HybridPdfParser:
                     "status": "completed" if crop_recovered else "noop",
                     "target_pages": sorted(crop_boxes),
                     "recovered_tables": crop_recovered,
+                }
+            )
+
+        # Formula thumbnails are often much smaller than an equivalent raster
+        # table.  When their parsed symbols disagree with the immediate
+        # ``where`` definitions, re-render just that source region and compare
+        # the independent OCR result conservatively.
+        formula_crop_pages = {
+            page.page_number
+            for page in document.pages
+            if page.page_number in merged_ocr
+            and any(
+                str(item.get("block_type") or "").casefold() == "formula"
+                for item in page.rich_blocks
+            )
+        }
+        if formula_crop_pages:
+            formula_recovered, formula_crops, formula_crop_warnings = (
+                self._recover_suspect_formula_crops(
+                    document,
+                    path,
+                    formula_crop_pages,
+                )
+            )
+            warnings.extend(formula_crop_warnings)
+            trace.append(
+                {
+                    "parser": "formula-crop-ocr",
+                    "status": "completed" if formula_crops else "noop",
+                    "target_pages": sorted(formula_crop_pages),
+                    "source_crops": formula_crops,
+                    "recovered_formulas": formula_recovered,
                 }
             )
 

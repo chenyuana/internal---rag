@@ -45,7 +45,7 @@ from app.ingestion.pipeline import (
     table_rows_from_html,
     table_to_semantic_text,
 )
-from app.ingestion.regulations import match_article_heading
+from app.ingestion.regulations import match_article_heading, table_lead_in_line
 from app.ingestion.regulatory_structure import expand_regulatory_blocks
 
 # 23-48-FINAL RULE Amendment27805.pdf (gust-load lateral mass ratio, §23.443).
@@ -1189,12 +1189,24 @@ class ScannedRegulatoryPdfParser(ParserPlugin):
         for block in pieces:
             if block.block_type == "annotation":
                 continue
+            carried: BlockRecord | None = None
             if pending and (
                 block.section_path != pending[0].section_path
                 or block.block_type in {"heading", "table", "figure"}
                 or sum(len(b.text) + 2 for b in pending) + len(block.text) > 1600
             ):
+                if (
+                    block.block_type == "table"
+                    and pending[-1].block_type != "table"
+                    and pending[-1].section_path == block.section_path
+                    and table_lead_in_line(pending[-1].text) is not None
+                ):
+                    # Keep the table's caption with the table it introduces
+                    # instead of publishing it as a separate sibling chunk.
+                    carried = pending.pop()
                 flush()
+            if carried is not None:
+                pending.append(carried)
             pending.append(block)
             if block.block_type in {"table", "figure"} or sum(len(b.text) for b in pending) >= 1600:
                 flush()

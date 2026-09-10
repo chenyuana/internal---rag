@@ -67,3 +67,16 @@ def test_semantic_questions_are_not_marked_as_inventory() -> None:
     assert QueryAnalyzer().analyze("系统有哪些功能？").requires_inventory is False
     assert QueryAnalyzer().analyze("这个功能怎么用？").requires_inventory is False
     assert QueryAnalyzer().analyze("如何部署这个系统？").requires_inventory is False
+
+
+def test_commenter_list_is_entity_enumeration() -> None:
+    result = QueryAnalyzer().analyze(
+        "该规则的主要评论方有哪些类型？请列举具体机构。"
+    )
+
+    assert result.query_type == "enumeration"
+    assert result.requires_inventory is False
+
+
+def test_generic_feature_question_is_not_entity_enumeration() -> None:
+    assert QueryAnalyzer().analyze("系统有哪些功能？").query_type == "fact"

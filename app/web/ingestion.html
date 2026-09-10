@@ -9,7 +9,7 @@
       name="description"
       content="内网技术资料自动解析、质量复核与 RAGFlow 发布工作台"
     />
-    <link rel="stylesheet" href="/assets/ingestion.css?v=20260908-page-tone-1" />
+    <link rel="stylesheet" href="/assets/ingestion.css?v=20260909-page-dialog-2" />
   </head>
   <body>
     <header class="topbar">
@@ -394,10 +394,23 @@
           <h2 id="pageDialogTitle">解析详情</h2>
           <p id="pageDialogMeta"></p>
         </div>
-        <button class="dialog-close" id="pageDialogClose" type="button" aria-label="关闭">
-          ×
-        </button>
+        <div class="page-dialog-actions">
+          <div class="page-reprocess-actions">
+            <button class="secondary-button" id="recleanPageButton" type="button">
+              使用缓存重新清洗
+            </button>
+            <button class="secondary-button" id="reocrPageButton" type="button">
+              重新 OCR 本页
+            </button>
+          </div>
+          <button class="dialog-close" id="pageDialogClose" type="button" aria-label="关闭">
+            ×
+          </button>
+        </div>
       </header>
+      <p class="page-action-hint" id="pageActionHint" role="status">
+        重新清洗只复用缓存；重新 OCR 仅发送当前页。两种方式都会重建相关 Chunk。
+      </p>
       <div class="page-dialog-body">
         <section class="source-preview">
           <iframe id="pageSourceFrame" title="原始文档页面"></iframe>
@@ -470,6 +483,6 @@
       </form>
     </dialog>
 
-    <script src="/assets/ingestion.js?v=20260908-llm-1" defer></script>
+    <script src="/assets/ingestion.js?v=20260910-publish-preview-1" defer></script>
   </body>
 </html>

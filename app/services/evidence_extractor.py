@@ -109,9 +109,14 @@ class EvidenceExtractor:
                     )
                 )
         ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+        limit = (
+            self._settings.enumeration_max_evidence_sentences
+            if query.query_type == "enumeration"
+            else self._settings.max_evidence_sentences
+        )
         return [
             item[3]
-            for item in ranked[: self._settings.max_evidence_sentences]
+            for item in ranked[:limit]
         ]
 
     @staticmethod

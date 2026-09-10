@@ -572,3 +572,28 @@ D:\internal-rag\source\internal-rag\
 ### 注意
 - 本修复只针对「有矢量表格线框」的 text_layer_review 页；纯文本/扫描假字页仍走 OCR，行为不变。
 - 假字映射基于单份文档推导，若其他损坏字体文档出现不同假字码位，需要补充映射表。
+
+---
+
+## 九、2026-09-10：块级关联信息通用化（表格 caption / 附录横幅 / FR 标签 / 表锚点 / 去枚举）
+
+> 完整记录见 `HANDOFF-2026-09-10.md`。涉及文件：`app/ingestion/pipeline.py`、`app/ingestion/regulations.py`、`app/ingestion/parsers/scan_regulatory.py`、`app/ingestion/publishers/ragflow.py`、`app/ingestion/jobs.py`、`app/services/domain_terms.py`、`app/web/static/ingestion.js`、`app/web/ingestion.html`。
+
+| # | 改动 | 通用判据 | 实测结果 |
+|---|---|---|---|
+| 1 | 表格 caption 随表发布（含跨小节归并） | 位置 + 形态（`… as follows:` 紧邻表格） | 悬空前导句 21→2；表格块数不变（205→205） |
+| 2 | 附录横幅识别/拆分（`APPENDIX I COMMITTEE IV …`） | 排版（全大写）+ 首尾边界守卫 | 全库 3 份文档 9 处；75-19 p29 全部 12 块归入 `APPENDIX I` |
+| 3 | 句子碎片不再被当成表标题 | 位置 + 标点形态（以 `:` 结尾且上段无句末标点） | 全库 2 处（均在 75-26） |
+| 4 | 标签行判定改为「形态 + 位置」 | 形态（全大写+冒号）+ 位置（报头/分节状态机，含合订本重开） | 取代 6 标签枚举；72 份 A/B 中 66 份、2,947 处归属变化（收益与代价见 HANDOFF 第五节） |
+| 5 | 表锚点：表头字段名 + 首列标识 + 标识符形状 | 结构 + 形状 | 286 表块全部获得锚点，共 +1,383；非表格 chunk 逐字不变；**发布时重算，无需重解析** |
+| 6 | 删除 47 词「横幅词表」 | —（净删代码） | 实测该表在防不存在的问题，且误杀真表头（`Normal and utility categories` 等） |
+| 7 | 剥离浏览器打印页脚 `about:blank N/M` | 形态 | 57 份文档（最多 88 处/文档）；引用跳页不受影响（页码来自 `positions` / `页码：` 头） |
+| 8 | 预览面板与实际发布内容同源 | 单一渲染源 | `ragflow.chunk_publish_facets()`；769-chunk 真实文档 821 次 preview↔plan 对比 0 处不一致 |
+| 9 | 表格 caption 实为表内分组标签时不提升为 section | 派生性（标题 = 表内某值的截断，覆盖率 ≥0.6，文档级取值表） | 全库 90 个表标题只命中 3 处（全是真缺陷），87 个真 caption 不动；75-31 p65/p66 表块回到 `APPENDIX I - MISCELLANEOUS PROPOSALS DEFERRED.` |
+| 10 | 折行标题合并（含「表标题去重抢先吃掉尾行」的顺序修复） | 形态（两行全大写 + 首行以连接词结尾 + 合并 ≤200 字符）+ 位置（去重前先合并）；`_title_repeats_section` 用派生性（标题 ⊂ 已有 section 标签） | 75-31 p68 合并为完整 APPENDIX III 标题、表格 41 行归回该标题；全库 34,237 块中 59 块带截断 section（3 份文档）；真正独立截断标题仅 2 处，其中 75-10 p73 因续行为「首词全大写 + 正文」暂未覆盖 |
+
+**验证**：全量单元测试 920 项通过；11 项失败与事故前最新版完全一致（10 项既有失败与本节改动无关：`hybrid_pdf` 版本号、CSS 缓存版本号、OCR 路由切块等；另有 `test_split_blocks_filters_fullpage_figure_and_duplicate_table_title`，在 09:42 旧副本基线上同样失败，故亦非本轮引入）；`ruff check app tests` 本轮改动文件全部通过；`mypy` 改动范围干净（`pipeline.py` 既有 38 个错误数量不变）。
+
+> 2026-09-10 下午事故处置：`app/ingestion/pipeline.py` 曾被 PowerShell 5.1 的 ANSI 读写破坏 322 处（详见 `HANDOFF-2026-09-10.md` 第九节）。按用户决定改用 09:42 旧副本基线（sha `9bee4d62`），并把上表 1–10 项改动逐项重放回来；重放保真度以损坏前编译的 `.pyc` 常量集逐函数核对（字面量全部一致），符号面差异为 0。
+
+**生效方式**：关键词/锚点/发布前缀属发布时重算，**重启网关后重新 publish 即生效**；chunk 正文与 section_path 类改动**必须重解析**。

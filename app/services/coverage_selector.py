@@ -205,6 +205,7 @@ class CoverageSelector:
                 subquery,
                 cell_chunks=cell_chunks,
                 missing_subjects=missing_subjects or set(),
+                retrieval_view=plan.query_type == "enumeration",
             )
             matrix.append(
                 CoverageCell(
@@ -230,6 +231,7 @@ class CoverageSelector:
         *,
         cell_chunks: list[RetrievedChunk],
         missing_subjects: set[str],
+        retrieval_view: bool = False,
     ) -> tuple[str, str | None]:
         """格子四态判定：covered / not_specified / low_confidence / no_document。
 
@@ -242,6 +244,11 @@ class CoverageSelector:
             return "no_document", "subject_document_not_found"
         if not cell_chunks:
             return "not_specified", "no_dimension_evidence_selected"
+        # 枚举计划中的 cell 是互补的“检索视角”，不是需要在正文中逐字出现的
+        # 比较维度。跨语言适航资料里中文 aspect 与英文评论段落不会有词面重合；
+        # 已通过相似度和 reranker 的候选即可作为该视角被覆盖。
+        if retrieval_view:
+            return "covered", None
         if cell_has_substantive_evidence(cell_chunks, subquery.aspect):
             return "covered", None
         return (

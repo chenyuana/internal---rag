@@ -32,7 +32,7 @@ from typing import Any
 import httpx
 
 from app.core.config import LlmStructureSettings
-from app.ingestion.regulations import extract_keywords
+from app.ingestion.regulations import build_question_aliases, extract_keywords
 
 _JSON_ONLY = re.compile(r"^\s*[\[{]", re.MULTILINE)
 
@@ -118,12 +118,21 @@ def apply_events(
         title = (active.title if active else None) or (section[-1] if section else "Document preamble")
         article = active.article_id if active else None
         article_aliases: list[str] = []
-        keywords = extract_keywords(title, section, article_aliases)
+        text = str(getattr(chunk, "text", ""))
+        keywords = extract_keywords(
+            title,
+            section,
+            article_aliases,
+            text=text,
+            table_rows=getattr(chunk, "table_rows", None),
+        )
+        questions = build_question_aliases(None, title, text=text)
         updated = (
             getattr(chunk, "section_path", None) != section
             or getattr(chunk, "title", None) != title
             or getattr(chunk, "article_id_normalized", None) != article
             or getattr(chunk, "keywords", None) != keywords
+            or getattr(chunk, "question_aliases", None) != questions
         )
         if updated:
             changed += 1
@@ -134,6 +143,7 @@ def apply_events(
         assign(chunk, "article_id_normalized", article)
         assign(chunk, "article_aliases", article_aliases)
         assign(chunk, "keywords", keywords)
+        assign(chunk, "question_aliases", questions)
     return changed
 
 

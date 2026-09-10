@@ -1567,18 +1567,53 @@ h1 em {
   box-shadow: 0 30px 100px rgba(20, 34, 27, 0.28);
 }
 
+.page-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+
 .page-dialog::backdrop {
   background: rgba(14, 22, 18, 0.62);
   backdrop-filter: blur(5px);
 }
 
 .page-dialog-header {
+  flex: 0 0 auto;
   height: 96px;
   padding: 18px 24px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--line);
+}
+
+.page-dialog-actions,
+.page-reprocess-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.page-reprocess-actions .secondary-button {
+  padding: 9px 12px;
+  font-size: 11px;
+}
+
+.page-action-hint {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 9px 22px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  background: #f8f6ef;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.page-action-hint.error {
+  color: var(--red);
+  background: #fff4f1;
 }
 
 .page-dialog-header h2,
@@ -1603,7 +1638,8 @@ h1 em {
 }
 
 .page-dialog-body {
-  height: calc(100% - 96px);
+  min-height: 0;
+  flex: 1 1 auto;
   display: grid;
   grid-template-columns: minmax(440px, 1.15fr) minmax(420px, 0.85fr);
 }
@@ -1941,6 +1977,13 @@ h1 em {
   }
 
   .llm-structure-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .page-dialog-header,
+  .page-dialog-actions,
+  .page-reprocess-actions {
     align-items: stretch;
     flex-direction: column;
   }

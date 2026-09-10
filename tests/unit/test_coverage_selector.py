@@ -112,6 +112,40 @@ def test_selector_keeps_new_document_bonus_outside_comparison() -> None:
     assert {item.chunk_id for item in selection.chunks} == {"a1", "b1"}
 
 
+def test_enumeration_cells_accept_cross_language_retrieval_evidence() -> None:
+    """枚举 cell 是检索视角；英文正文无需与中文 aspect 有字面重合。"""
+    plan = QueryPlan(
+        query_type="enumeration",
+        aspects=["实体类型与总述", "分散在讨论段落中的实体"],
+        subqueries=[
+            SubQuery(id="q1", query="评论方类型", aspect="实体类型与总述"),
+            SubQuery(
+                id="q2",
+                query="received comments from commenter",
+                aspect="分散在讨论段落中的实体",
+            ),
+        ],
+        synthesis_mode="map_reduce",
+    )
+    results = {
+        "q1": [
+            _chunk("summary", "faa-23-62", 0.9, text="The FAA received 244 comments.")
+        ],
+        "q2": [
+            _chunk(
+                "names",
+                "faa-23-62",
+                0.8,
+                text="Comments were received from Transport Canada and EASA.",
+            )
+        ],
+    }
+
+    selection = CoverageSelector().select(plan, results, limit=4)
+
+    assert [cell.status for cell in selection.matrix] == ["covered", "covered"]
+
+
 def test_multi_hop_selector_guarantees_document_diversity() -> None:
     """multi_hop 矩阵：候选池中出现过的文档都至少进 1 个代表，避免单一
     关键词文档垄断名额（如 5G 基站文档挤掉机巢/河湖文档）。"""
