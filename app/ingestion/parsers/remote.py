@@ -14,6 +14,11 @@ from typing import Any
 import httpx
 
 from app.core.config import RemoteParserSettings
+from app.ingestion.pipeline import (
+    degenerate_table_reason,
+    degenerate_table_text,
+    table_rows_from_html,
+)
 
 MAX_REMOTE_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_REMOTE_ARCHIVE_MEMBERS = 10_000
@@ -707,6 +712,23 @@ class MinerUClient(RemoteParserClient):
                         if text:
                             page_parts.setdefault(page_number, []).append(text)
                         item_type = str(raw_item.get("type", "")).casefold()
+                        # A remote "table" with no grid at all is a heading or a
+                        # caption the model boxed as a table (Docket 21-44 p. 10:
+                        # "§ 23.397 Limit control forces and torques." returned as
+                        # a three-row, five-column table).  Keep its text, drop
+                        # the structure, and leave a marker for the refresh paths.
+                        table_demotion = (
+                            degenerate_table_reason(
+                                table_rows_from_html(str(raw_item.get("table_body", "")))
+                            )
+                            if item_type == "table" and raw_item.get("table_body")
+                            else None
+                        )
+                        if table_demotion:
+                            raw_item["degenerate_table"] = table_demotion
+                            text = degenerate_table_text(
+                                table_rows_from_html(str(raw_item.get("table_body", "")))
+                            )
                         image_filename, image_content, image_mime_type = cls._archive_asset(
                             archive,
                             json_name=name,
@@ -719,14 +741,25 @@ class MinerUClient(RemoteParserClient):
                         page_blocks.setdefault(page_number, []).append(
                             RemoteContentBlock(
                                 page_number=page_number,
-                                block_type=cls._block_type(raw_item),
+                                block_type=(
+                                    "paragraph"
+                                    if table_demotion
+                                    else cls._block_type(raw_item)
+                                ),
                                 text=text,
                                 raw_item=raw_item,
                                 table_html=(
-                                    clean_inline_latex(str(raw_item.get("table_body", "")).strip())
-                                    if item_type == "table"
-                                    and "<table" in str(raw_item.get("table_body", "")).casefold()
-                                    else None
+                                    None
+                                    if table_demotion
+                                    else (
+                                        clean_inline_latex(
+                                            str(raw_item.get("table_body", "")).strip()
+                                        )
+                                        if item_type == "table"
+                                        and "<table"
+                                        in str(raw_item.get("table_body", "")).casefold()
+                                        else None
+                                    )
                                 ),
                                 caption=cls._caption(raw_item),
                                 bbox=cls._bbox(raw_item),

@@ -16,7 +16,10 @@ from typing import Any
 import pypdfium2 as pdfium
 from PIL import ImageOps
 
-from app.ingestion.pipeline import table_rows_from_html
+from app.ingestion.pipeline import (
+    collapsed_table_rows,
+    table_rows_from_html,
+)
 
 
 class _Cells(HTMLParser):
@@ -44,6 +47,13 @@ def structure_issue(markup: str) -> str | None:
     rows = table_rows_from_html(markup)
     if not rows:
         return None
+    # One data row whose every cell carries a whole column: the printed row
+    # separators are gone (Docket 21-44 p. 12 arrived as a header row plus one
+    # data row holding the altitude, vapour-pressure, humidity and density
+    # columns run together).  The caller rebuilds it from column agreement or, if
+    # that is not provable, keeps it out of the index.
+    if collapsed_table_rows(rows):
+        return "collapsed_row"
     # Repeated dot leaders within one label indicate distinct printed rows.
     # Numeric cells beside them may have lost all row separators. Flag the
     # ambiguity; never guess how to partition a digit string into values.

@@ -40,9 +40,11 @@ from app.ingestion.pipeline import (
     PageRecord,
     ParsedDocument,
     compact_chars,
+    split_collapsed_table_rows,
     split_structured_table_block,
     stable_id,
     table_rows_from_html,
+    table_to_html,
     table_to_semantic_text,
 )
 from app.ingestion.regulations import match_article_heading, table_lead_in_line
@@ -914,8 +916,13 @@ class ScannedRegulatoryPdfParser(ParserPlugin):
                     "aside_text",
                 }:
                     item["text"] = str(raw.get("text", ""))
-                if raw.get("type") == "table":
+                if raw.get("type") == "table" and not raw.get("degenerate_table"):
                     item["table_html"] = clean_inline_latex(str(raw.get("table_body", ""))) or None
+                elif raw.get("degenerate_table"):
+                    # The remote model boxed a heading as a table; it was demoted
+                    # to text when the blocks were built and must stay text here.
+                    item["block_type"] = "paragraph"
+                    item["table_html"] = None
             if progress_callback:
                 progress_callback(1, 1)
         if not source_items:
@@ -972,6 +979,15 @@ class ScannedRegulatoryPdfParser(ParserPlugin):
                 item["table_review_status"] = "needs_review"
                 repaired = verified_table(source_hash, page.page_number, markup)
                 method = "source_visual_review" if repaired else None
+                if not repaired and issue == "collapsed_row":
+                    # The row separators are gone but every value is still in the
+                    # cells.  Rebuild the rows only when the columns agree on the
+                    # count and each column has one readable sequence; otherwise
+                    # fall through to the quarantine below, never guess.
+                    rebuilt = split_collapsed_table_rows(table_rows_from_html(markup))
+                    if rebuilt:
+                        repaired = table_to_html(rebuilt, header_rows=1)
+                        method = "column_count_agreement"
                 # Only the supported fragmented-header shape is auto-recovered.
                 # Other suspect layouts remain quarantined, never guessed.
                 if (
@@ -1286,6 +1302,19 @@ class ScannedRegulatoryPdfParser(ParserPlugin):
             for item in p.rich_blocks
             if item.get("exclusion_reason")
         ]
+        demoted = [
+            p.page_number
+            for p in pages
+            for item in p.rich_blocks
+            if (item.get("raw_ocr_item") or {}).get("degenerate_table")
+        ]
+        if demoted:
+            gate(
+                "table_degenerate_demoted",
+                "warn",
+                "Remote table structure labelled a heading/caption as a table; "
+                f"kept as text on page(s) {sorted(set(demoted))}.",
+            )
         uncertain = [a for a in annotations if a["exclusion_reason"] != "mineru_excluded"]
         if uncertain:
             gate(

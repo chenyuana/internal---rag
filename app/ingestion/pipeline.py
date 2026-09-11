@@ -739,6 +739,333 @@ def table_has_content_risk(rows: list[list[object]]) -> bool:
     return False
 
 
+# A remote table-structure model sometimes labels a heading or a caption as a
+# table.  Docket 21-44 p. 10 printed "§ 23.397 Limit control forces and
+# torques." and the parser returned it as a three-row, five-column "table"
+# holding those two lines and one OCR noise glyph, which published as a table
+# chunk whose body read "记录1：第1列=torques.".
+#
+# A table's defining property is that at least one row carries two or more cells
+# side by side -- a header row or a data row.  When no row does, the block is a
+# single column of text whose "cells" are line fragments, whatever the model
+# called it.  That test needs no row-count or height threshold: a one-row table
+# is still a table (its header row has several cells; Docket 75-19 p. 31 is
+# exactly that) and a tall block is still text if it never has two cells in a
+# row.  Across the 51 stored remote table blocks one block is in this class, the
+# heading above, and the two single-row tables in the corpus are both grids and
+# stay tables.
+def degenerate_table_reason(rows: list[list[str]] | None) -> str | None:
+    """Return why a remote "table" has no grid, or ``None``.
+
+    The demotion is lossless: the cells become the block's text, so no content
+    is dropped -- only the claim that they are columns.
+    """
+    table = [
+        [" ".join(str(cell).split()) for cell in row]
+        for row in (rows or [])
+        if row is not None
+    ]
+    table = [row for row in table if any(row)]
+    if not table:
+        return None
+    if any(sum(1 for cell in row if cell) >= 2 for row in table):
+        return None
+    return "no_grid"
+
+
+def degenerate_table_text(rows: list[list[str]] | None) -> str:
+    """Text of a demoted "table": its filled cells in reading order."""
+    return " ".join(
+        cell
+        for row in (rows or [])
+        if row
+        for cell in (" ".join(str(item).split()) for item in row)
+        if cell
+    ).strip()
+
+
+_COLLAPSED_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?")
+_COLLAPSED_MIN_VALUES = 3
+
+
+def _numeric_value_tokens(cell: str) -> list[str]:
+    return _COLLAPSED_TOKEN_RE.findall(cell)
+
+
+def collapsed_table_rows(rows: list[list[str]] | None) -> bool:
+    """Is this table one data row whose every cell holds a whole column?
+
+    The shape alone settles it: a table with a *single* data row cannot carry
+    four columns of fourteen values, so the row separators were lost (Docket
+    21-44 p. 12 arrived as a header row plus one data row whose cells were the
+    altitude, vapour-pressure, humidity and density columns run together).
+
+    A two-row body is deliberately **not** flagged: an ordinary small table can
+    legitimately hold several numbers in a cell, and this predicate gates a
+    quarantine, so it stays narrow.
+    """
+    table = [
+        [" ".join(str(cell).split()) for cell in row]
+        for row in (rows or [])
+        if row is not None
+    ]
+    table = [row for row in table if any(row)]
+    if len(table) != 2:
+        return False
+    cells = [cell for cell in table[1] if cell]
+    return bool(cells) and all(
+        len(_numeric_value_tokens(cell)) >= _COLLAPSED_MIN_VALUES for cell in cells
+    )
+
+
+def _token_text(token: str) -> str:
+    """Restore the leading zero the OCR dropped after the first value."""
+    return "0" + token if token.startswith(".") else token
+
+
+def _grouped_integer_readings(text: str) -> list[tuple[list[str], list[float]]]:
+    """Every way to read a run of thousands-grouped integers.
+
+    Each reading carries both its token strings (for output, so no digit is lost)
+    and their values (for the monotonicity test).
+    """
+    readings: list[tuple[list[str], list[float]]] = []
+
+    def walk(index: int, tokens: list[str], values: list[float]) -> None:
+        if index == len(text):
+            readings.append((list(tokens), list(values)))
+            return
+        for length in (1, 2, 3):
+            digits = text[index : index + length]
+            if not digits.isdigit():
+                continue
+            chunk = digits
+            cursor = index + length
+            while (
+                cursor < len(text)
+                and text[cursor] in ",."
+                and text[cursor + 1 : cursor + 4].isdigit()
+            ):
+                chunk += text[cursor] + text[cursor + 1 : cursor + 4]
+                cursor += 4
+            tokens.append(chunk)
+            values.append(float(chunk.replace(",", "").replace(".", "")))
+            walk(cursor, tokens, values)
+            tokens.pop()
+            values.pop()
+
+    walk(0, [], [])
+    return readings
+
+
+def _decimal_readings(
+    text: str,
+    *,
+    state_limit: int = 400,
+) -> list[tuple[list[str], list[float]]]:
+    """Every monotone reading of a run of decimals.
+
+    The OCR loses the decimal point as well as the leading zero, so a token is
+    either a dotted number or a bare digit run read as ``0.<digits>``.  The cell
+    itself says how many digits a value has -- the dotted values show the widths
+    it uses -- and a bare run must be split into chunks of those widths, which is
+    what keeps "0.11721010" from being read as 0.117210 followed by 0.10.
+    """
+    widths = _decimal_widths(text)
+    readings: list[tuple[list[str], list[float]]] = []
+    for descending in (True, False):
+        states: list[list[tuple[list[str], list[float]]]] = [
+            [] for _ in range(len(text) + 1)
+        ]
+        states[0] = [([], [])]
+        for index in range(len(text)):
+            if not states[index]:
+                continue
+            for tokens, values in states[index][:state_limit]:
+                for token in _decimal_tokens_at(text, index, widths):
+                    if token == ".":
+                        states[index + 1].append((tokens, values))
+                        continue
+                    if token.startswith(".") or "." in token:
+                        value = float(token)
+                    else:
+                        value = float("0." + token)
+                    if values:
+                        if descending and value > values[-1]:
+                            continue
+                        if not descending and value < values[-1]:
+                            continue
+                    bucket = states[index + len(token)]
+                    if len(bucket) < state_limit:
+                        bucket.append((tokens + [token], values + [value]))
+        readings.extend(states[len(text)])
+    return readings
+
+
+_DOTTED_WIDTH_RE = re.compile(r"\d?\.(\d+)")
+_MAX_DECIMALS = 6
+
+
+def _decimal_widths(text: str) -> set[int]:
+    """Decimal widths this cell uses, ignoring one-off widths.
+
+    A width that occurs once is usually the OCR gluing two values together
+    (".11721010"), so only widths seen at least twice define the column's
+    vocabulary; a very short cell falls back to whatever it has.
+    """
+    counts = Counter(len(match.group(1)) for match in _DOTTED_WIDTH_RE.finditer(text))
+    kept = {width for width, count in counts.items() if count >= 2}
+    return kept or set(counts)
+
+
+def _decimal_tokens_at(text: str, index: int, widths: set[int]) -> list[str]:
+    """Tokens that may start at ``index``: a dotted number, or a bare digit run.
+
+    Both must use one of the cell's decimal widths, which is what stops a run such
+    as "11721010" from being read as 0.117210 followed by 0.10.
+    """
+    tokens: list[str] = []
+    dotted = re.match(r"\d{0,2}\.\d{1,6}", text[index:])
+    if dotted is not None:
+        width = len(dotted.group(0).split(".")[1])
+        if not widths or width in widths:
+            tokens.append(dotted.group(0))
+    for length in sorted(widths) or list(range(1, _MAX_DECIMALS + 1)):
+        chunk = text[index : index + length]
+        if len(chunk) == length and chunk.isdigit():
+            tokens.append(chunk)
+    if text[index] == ".":
+        # A separator left behind when the value it belonged to lost its digits;
+        # it carries no value of its own.
+        tokens.append(".")
+    return tokens
+
+
+def _is_monotone(values: list[float]) -> bool:
+    return values == sorted(values) or values == sorted(values, reverse=True)
+
+
+def _printed_token(token: str, *, decimal: bool) -> str:
+    """Restore the digits the OCR dropped: the leading zero, and the point itself."""
+    if decimal and "." not in token:
+        return "0." + token
+    return "0" + token if token.startswith(".") else token
+
+
+def _reading_quality(tokens: list[str]) -> tuple[int, int]:
+    """Prefer readings that use one decimal width and keep every source digit."""
+    widths = {len(token.split(".")[1]) for token in tokens if "." in token}
+    return (len(widths), -len("".join(tokens)))
+
+
+def _column_readings(cell: str) -> list[tuple[list[str], list[float]]]:
+    """Monotone readings of one collapsed cell (grouped integers or decimals).
+
+    A cell carrying thousands separators is a run of grouped integers; otherwise
+    it is a run of decimals.  The reader decides how a token is valued, because
+    the token text alone is ambiguous: "0.403" is a decimal here, while "8.000"
+    in a grouped run means eight thousand.
+    """
+    candidates = (
+        _grouped_integer_readings(cell) if "," in cell else _decimal_readings(cell)
+    )
+    return [item for item in candidates if _is_monotone(item[1])]
+
+
+def _digits(text: str) -> str:
+    return re.sub(r"\D", "", text)
+
+
+def split_collapsed_table_rows(rows: list[list[str]] | None) -> list[list[str]] | None:
+    """Rebuild a table whose row separators were lost, or return ``None``.
+
+    Every column is read as a numeric run and only monotone readings are kept, so
+    the row count must be one that *at least two columns independently support*
+    and that every column can meet; under that count each column must have exactly
+    one distinct value sequence.  Anything else returns ``None`` and the caller
+    keeps the table out of the search index instead of guessing.
+
+    The rebuild is checked against the source digits, so no digit can be invented
+    or dropped: each rebuilt column must carry exactly the digits of the cell it
+    came from.
+    """
+    table = [
+        [" ".join(str(cell).split()) for cell in row]
+        for row in (rows or [])
+        if row is not None
+    ]
+    table = [row for row in table if any(row)]
+    if len(table) != 2:
+        return None
+    header, collapsed = table[0], table[1]
+    readings: list[list[tuple[list[str], list[float]]] | None] = []
+    for index in range(len(collapsed)):
+        cell = collapsed[index]
+        readings.append(_column_readings(cell) if cell else None)
+    if all(item is None for item in readings):
+        return None
+
+    feasible = [{len(values) for _tokens, values in column} for column in readings if column]
+    shared = set.intersection(*feasible) if feasible else set()
+    counts = [
+        count
+        for count in shared
+        if count >= _COLLAPSED_MIN_VALUES
+        and sum(1 for column in feasible if count in column) >= 2
+    ]
+    if len(counts) != 1:
+        return None
+    count = counts[0]
+
+    column_tokens: list[list[str] | None] = []
+    for column in readings:
+        if column is None:
+            column_tokens.append(None)
+            continue
+        distinct: dict[tuple[float, ...], list[str]] = {}
+        for tokens, numbers in column:
+            if len(numbers) != count:
+                continue
+            key = tuple(round(number, 9) for number in numbers)
+            current = distinct.get(key)
+            # Readings can agree on the values while splitting the digits
+            # differently ("0.8591" vs "0.85910"); keep the one that preserves
+            # every source digit.
+            if current is None or _reading_quality(tokens) < _reading_quality(current):
+                distinct[key] = tokens
+        if len(distinct) != 1:
+            return None
+        column_tokens.append(next(iter(distinct.values())))
+
+    for index, column_text in enumerate(column_tokens):
+        if column_text is None:
+            continue
+        # No digit may be lost or invented.  The comparison is by digit count,
+        # not by position: a zero can legitimately sit on either side of a value
+        # boundary ("0.1010" against "0.101" + "0.0463") without changing any
+        # value, and this check still catches a dropped or added digit.
+        if Counter(_digits("".join(column_text))) != Counter(_digits(collapsed[index])):
+            return None
+
+    rebuilt: list[list[str]] = [list(header)]
+    for row_index in range(count):
+        row = []
+        for index, column_text in enumerate(column_tokens):
+            if column_text is None:
+                row.append(collapsed[index] if index < len(collapsed) else "")
+                continue
+            token = _printed_token(
+                column_text[row_index], decimal="," not in collapsed[index]
+            )
+            if "," in collapsed[index]:
+                # A grouped-integer column: normalise the grouping separator only
+                # (the OCR wrote both "8.000" and "8,000"); no digit changes.
+                token = token.replace(".", ",")
+            row.append(token)
+        rebuilt.append(row)
+    return rebuilt
+
+
 def normalize_table_html(table_html: str, *, header_rows: int = 1) -> str:
     """Repair bounded OCR markup defects before normalizing table headers."""
 

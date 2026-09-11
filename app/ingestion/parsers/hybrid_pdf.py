@@ -39,7 +39,9 @@ from app.ingestion.pipeline import (
     analyze_complex_table_fidelity,
     build_chunks,
     clean_page,
+    collapsed_table_rows,
     compact_chars,
+    degenerate_table_text,
     detect_repeated_margin_lines,
     filter_federal_register_rich_blocks,
     filter_repeated_margin_rich_blocks,
@@ -50,6 +52,7 @@ from app.ingestion.pipeline import (
     normalize_table_html,
     repair_invalid_unicode,
     split_blocks,
+    split_collapsed_table_rows,
     split_merged_or_rows,
     stable_id,
     table_rows_from_html,
@@ -607,6 +610,15 @@ class HybridPdfParser:
                         )
                         if verified_rows != table_rows:
                             table_rows = verified_rows
+                            table_html = table_to_html(table_rows, header_rows=1)
+                    if table_rows and collapsed_table_rows(table_rows):
+                        # The remote model lost the row separators and returned a
+                        # whole column per cell; rebuild the rows from column
+                        # agreement, or leave the table untouched when that is not
+                        # provable (the review gate still lists the page).
+                        rebuilt_rows = split_collapsed_table_rows(table_rows)
+                        if rebuilt_rows:
+                            table_rows = rebuilt_rows
                             table_html = table_to_html(table_rows, header_rows=1)
                     table_title, detached_heading = (
                         HybridPdfParser._separate_table_caption(
@@ -1701,7 +1713,11 @@ class HybridPdfParser:
             refreshed: list[dict[str, Any]] = []
             for item in target.rich_blocks:
                 raw = item["raw_ocr_item"]
-                block_type = self.mineru._block_type(raw)
+                block_type = (
+                    "paragraph"
+                    if raw.get("degenerate_table")
+                    else self.mineru._block_type(raw)
+                )
                 caption = self.mineru._caption(raw)
                 table_html = (
                     normalize_table_html(
@@ -1711,6 +1727,23 @@ class HybridPdfParser:
                     else None
                 )
                 rows = table_rows_from_html(table_html) if table_html else []
+                if raw.get("degenerate_table"):
+                    # The remote model boxed a heading as a table; keep its text.
+                    text = degenerate_table_text(
+                        table_rows_from_html(str(raw.get("table_body", "")))
+                    )
+                    updated = copy.deepcopy(item)
+                    updated.update(
+                        {
+                            "block_type": "paragraph",
+                            "text": text,
+                            "table_html": None,
+                            "table_rows": [],
+                            "table_title": "",
+                        }
+                    )
+                    refreshed.append(updated)
+                    continue
                 if rows:
                     verified_rows = verified_hybrid_rows(
                         document.source_hash,
